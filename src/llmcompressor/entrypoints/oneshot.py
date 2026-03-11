@@ -22,6 +22,7 @@ from llmcompressor.args import parse_args
 from llmcompressor.core.session_functions import active_session
 from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.entrypoints.utils import post_process, pre_process
+from llmcompressor.observers.compile_config import set_observer_compile
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.pipelines import CalibrationPipeline
 
@@ -299,6 +300,8 @@ def oneshot(
     sequential_targets: list[str] | None = None,
     sequential_offload_device: str = "cpu",
     quantization_aware_calibration: bool = True,
+    sequential_prefetch: bool = False,
+    enable_observer_compile: bool = False,
     # Miscellaneous arguments
     output_dir: str | None = None,
     log_dir: str | None = None,
@@ -364,9 +367,10 @@ def oneshot(
     :param streaming: True to stream data from a cloud dataset.
     :param overwrite_cache: Whether to overwrite the cached preprocessed datasets.
     :param preprocessing_num_workers: Number of processes for dataset preprocessing.
-    :param dataloader_num_workers: Number of worker processes for data loading. Set to 0
-        to disable multiprocessing. Note: Custom data collators may not work with
-        multiprocessing. Default is 0.
+    :param dataloader_num_workers: Number of worker processes for data loading. Default
+        is 0 (safe for low CPU/GPU memory). Set to 2 or more for faster calibration if
+        you have sufficient RAM. Custom data collators may not work with
+        multiprocessing.
     :param min_tokens_per_module: Minimum percentage of tokens per
         module, relevant for MoE models.
     :param moe_calibrate_all_experts: Whether to calibrate all experts during MoE
@@ -388,6 +392,9 @@ def oneshot(
         calibration in the sequential pipeline. When True, quantization is applied
         during forward pass in calibration. When False, quantization is disabled
         during forward pass in calibration. Default is set to True.
+    :param sequential_prefetch: When using the sequential pipeline, prefetch the
+        next batch in a background thread to overlap onload with forward. Default
+        False; set True for faster calibration when GPU memory allows.
 
     # Miscellaneous arguments
     :param output_dir: Path to save the output model after calibration.
@@ -400,9 +407,10 @@ def oneshot(
 
     # pass all args directly into Oneshot
     local_args = {
-        k: v for k, v in locals().items() if k not in ("local_args", "kwargs")
+        k: v for k, v in locals().items() if k not in ("local_args", "kwargs", "enable_observer_compile")
     }
     one_shot = Oneshot(**local_args, **kwargs)
+    set_observer_compile(enable_observer_compile)
     one_shot()
 
     return one_shot.model
