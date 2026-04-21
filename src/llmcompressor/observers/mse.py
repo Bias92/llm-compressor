@@ -5,12 +5,8 @@ from compressed_tensors.quantization import QuantizationStrategy
 from torch import distributed as dist
 
 from llmcompressor.observers.base import MinMaxTuple, Observer
-from llmcompressor.observers.compile_config import (
-    get_compile_chunk_size,
-    get_torch_compile,
-)
 from llmcompressor.observers.helpers import lerp
-from llmcompressor.observers.mse_quant import _grid_search_mse  # noqa: F401
+from llmcompressor.observers.mse_quant import _grid_search_mse
 
 __all__ = ["MovingAverageMSEObserver"]
 
@@ -70,8 +66,6 @@ class MemorylessMSEObserver(Observer):
             self.patience,
             self.grid,
             self.norm,
-            enable_compile=get_torch_compile(),
-            chunk_size=get_compile_chunk_size(),
         )
 
 
@@ -134,8 +128,6 @@ class MovingAverageMSEObserver(Observer):
             self.patience,
             self.grid,
             self.norm,
-            enable_compile=get_torch_compile(),
-            chunk_size=get_compile_chunk_size(),
         )
 
         if hasattr(self, "min_vals") and self.avg_constant != 1.0:
