@@ -8,7 +8,7 @@ from compressed_tensors.quantization.lifecycle import fake_quantize
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 
 from llmcompressor.observers.base import MinMaxTuple
-from llmcompressor.observers.compile_config import (
+from llmcompressor.compile_config import (
     get_compile_chunk_size,
     get_torch_compile,
 )

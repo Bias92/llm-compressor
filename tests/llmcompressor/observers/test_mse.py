@@ -89,7 +89,7 @@ def test_mse_fp4():
 
 def test_mse_observer_torch_compile():
     """Test that MSE observer produces correct results with compiled inner loop"""
-    from llmcompressor.observers.compile_config import set_torch_compile
+    from llmcompressor.compile_config import set_torch_compile
 
     args = QuantizationArgs(
         num_bits=8,
