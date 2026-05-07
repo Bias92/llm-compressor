@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 
 from llmcompressor.args import parse_args
+from llmcompressor.compile_config import set_torch_compile
 from llmcompressor.core.session_functions import active_session
 from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.entrypoints.utils import post_process, pre_process
@@ -305,6 +306,7 @@ def oneshot(
     # Miscellaneous arguments
     output_dir: str | None = None,
     log_dir: str | None = None,
+    enable_compile: bool = False,
     **kwargs,
 ) -> PreTrainedModel:
     """
@@ -404,9 +406,13 @@ def oneshot(
     :return: The calibrated PreTrainedModel
     """
 
+    set_torch_compile(enable_compile)
+
     # pass all args directly into Oneshot
     local_args = {
-        k: v for k, v in locals().items() if k not in ("local_args", "kwargs")
+        k: v
+        for k, v in locals().items()
+        if k not in ("local_args", "kwargs", "enable_compile")
     }
     one_shot = Oneshot(**local_args, **kwargs)
     one_shot()
