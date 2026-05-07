@@ -7,8 +7,8 @@ from compressed_tensors.quantization import QuantizationArgs
 from compressed_tensors.quantization.lifecycle import fake_quantize
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 
-from llmcompressor.observers.base import MinMaxTuple
 from llmcompressor.compile_config import get_torch_compile
+from llmcompressor.observers.base import MinMaxTuple
 
 # Allow torch.compile to handle scalar conversions inside
 # compressed_tensors' calculate_qparams (float(bit_range)).
