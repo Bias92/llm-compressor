@@ -8,10 +8,7 @@ from compressed_tensors.quantization.lifecycle import fake_quantize
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 
 from llmcompressor.observers.base import MinMaxTuple
-from llmcompressor.compile_config import (
-    get_compile_chunk_size,
-    get_torch_compile,
-)
+from llmcompressor.compile_config import get_torch_compile
 
 # Allow torch.compile to handle scalar conversions inside
 # compressed_tensors' calculate_qparams (float(bit_range)).
@@ -27,6 +24,7 @@ def _grid_search_mse(
     patience: int,
     grid: float,
     norm: float,
+    chunk_size: int,
     global_scale: Optional[torch.Tensor] = None,
     optimize_global_scale: bool = False,
 ) -> MinMaxTuple:
@@ -74,6 +72,7 @@ def _grid_search_mse(
         patience,
         grid,
         norm,
+        chunk_size,
         global_scale,
         optimize_global_scale,
     )
@@ -92,6 +91,7 @@ def _grid_search_eager(
     patience: int,
     grid: float,
     norm: float,
+    chunk_size: int,  # noqa: ARG001  unused, kept for signature parity
     global_scale: Optional[torch.Tensor],
     optimize_global_scale: bool,
 ) -> MinMaxTuple:
@@ -141,6 +141,7 @@ def _grid_search_compiled(
     patience: int,
     grid: float,
     norm: float,
+    chunk_size: int,
     global_scale: Optional[torch.Tensor],
     optimize_global_scale: bool,
 ) -> MinMaxTuple:
@@ -151,7 +152,6 @@ def _grid_search_compiled(
     boundaries; compiled mode may run up to ``chunk_size - 1`` extra
     steps past the eager break point.
     """
-    chunk_size = get_compile_chunk_size()
     no_improve_count = 0
 
     # Eliminate stride/duck-sizing guards from view tensors
