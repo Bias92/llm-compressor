@@ -114,6 +114,3 @@ def test_mse_observer_torch_compile():
     finally:
         # always restore global state, even if assertions fail
         set_torch_compile(False)
-
-
-
