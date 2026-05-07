@@ -114,3 +114,70 @@ def test_mse_observer_torch_compile():
     finally:
         # always restore global state, even if assertions fail
         set_torch_compile(False)
+
+
+def test_oneshot_enable_compile_flag_propagates():
+    """Verify oneshot's enable_compile flag is forwarded to set_torch_compile."""
+    from unittest.mock import MagicMock, patch
+
+    from llmcompressor import oneshot as oneshot_fn
+
+    with patch("llmcompressor.entrypoints.oneshot.Oneshot") as mock_cls, patch(
+        "llmcompressor.entrypoints.oneshot.set_torch_compile"
+    ) as mock_set:
+        mock_cls.return_value.model = MagicMock()
+
+        oneshot_fn(model="ignored", enable_compile=True)
+        mock_set.assert_called_with(True)
+
+        oneshot_fn(model="ignored", enable_compile=False)
+        mock_set.assert_called_with(False)
+
+        # Default (flag not passed) should call with False
+        mock_set.reset_mock()
+        oneshot_fn(model="ignored")
+        mock_set.assert_called_with(False)
+
+
+def test_mse_observer_dispatches_compile_path():
+    """Verify set_torch_compile(True/False) routes between compiled and eager paths."""
+    from unittest.mock import patch
+
+    import llmcompressor.observers.mse_quant as mq
+    from llmcompressor.compile_config import set_torch_compile
+
+    args = QuantizationArgs(
+        num_bits=8,
+        type="int",
+        symmetric=True,
+        strategy="tensor",
+        observer="memoryless_mse",
+    )
+    observer = Observer.load_from_registry(
+        "memoryless_mse", base_name="weight", args=args
+    )
+    x = torch.randn(1, 1, 128)
+
+    real_compiled = mq._grid_search_compiled
+    real_eager = mq._grid_search_eager
+
+    try:
+        # eager path
+        set_torch_compile(False)
+        with patch.object(mq, "_grid_search_compiled") as m_compiled, patch.object(
+            mq, "_grid_search_eager", wraps=real_eager
+        ) as m_eager:
+            observer(x)
+            m_compiled.assert_not_called()
+            m_eager.assert_called_once()
+
+        # compile path
+        set_torch_compile(True)
+        with patch.object(mq, "_grid_search_eager") as m_eager, patch.object(
+            mq, "_grid_search_compiled", wraps=real_compiled
+        ) as m_compiled:
+            observer(x)
+            m_eager.assert_not_called()
+            m_compiled.assert_called_once()
+    finally:
+        set_torch_compile(False)
