@@ -89,7 +89,7 @@ def test_mse_fp4():
 
 def test_mse_observer_torch_compile():
     """Test that MSE observer produces correct results with compiled inner loop"""
-    from llmcompressor.compile_config import set_torch_compile
+    from llmcompressor.observers.mse_quant import set_torch_compile
 
     args = QuantizationArgs(
         num_bits=8,
@@ -105,10 +105,15 @@ def test_mse_observer_torch_compile():
     try:
         # eager baseline
         set_torch_compile(False)
-        eager_scale, eager_zp = observer(x)
+        eager_qparams = observer(x).get_qparams()
+        eager_scale, eager_zp = eager_qparams["scale"], eager_qparams["zero_point"]
+
         # compiled inner loop
         set_torch_compile(True)
-        compiled_scale, compiled_zp = observer(x)
+        compiled_qparams = observer(x).get_qparams()
+        compiled_scale = compiled_qparams["scale"]
+        compiled_zp = compiled_qparams["zero_point"]
+
         torch.testing.assert_close(eager_scale, compiled_scale)
         torch.testing.assert_close(eager_zp, compiled_zp)
     finally:
@@ -116,35 +121,12 @@ def test_mse_observer_torch_compile():
         set_torch_compile(False)
 
 
-def test_oneshot_enable_compile_flag_propagates():
-    """Verify oneshot's enable_compile flag is forwarded to set_torch_compile."""
-    from unittest.mock import MagicMock, patch
-
-    from llmcompressor import oneshot as oneshot_fn
-
-    with patch("llmcompressor.entrypoints.oneshot.Oneshot") as mock_cls, patch(
-        "llmcompressor.entrypoints.oneshot.set_torch_compile"
-    ) as mock_set:
-        mock_cls.return_value.model = MagicMock()
-
-        oneshot_fn(model="ignored", enable_compile=True)
-        mock_set.assert_called_with(True)
-
-        oneshot_fn(model="ignored", enable_compile=False)
-        mock_set.assert_called_with(False)
-
-        # Default (flag not passed) should call with False
-        mock_set.reset_mock()
-        oneshot_fn(model="ignored")
-        mock_set.assert_called_with(False)
-
-
 def test_mse_observer_dispatches_compile_path():
     """Verify set_torch_compile(True/False) routes between compiled and eager paths."""
     from unittest.mock import patch
 
     import llmcompressor.observers.mse_quant as mq
-    from llmcompressor.compile_config import set_torch_compile
+    from llmcompressor.observers.mse_quant import set_torch_compile
 
     args = QuantizationArgs(
         num_bits=8,

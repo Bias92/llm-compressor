@@ -19,12 +19,12 @@ from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 
 from llmcompressor.args import parse_args
-from llmcompressor.compile_config import set_torch_compile
 from llmcompressor.core.session_functions import active_session
 from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.entrypoints.utils import post_process, pre_process
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.modeling.offset_norm import norm_calibration_context
+from llmcompressor.observers.mse_quant import set_torch_compile
 from llmcompressor.pipelines import CalibrationPipeline
 
 __all__ = ["Oneshot", "oneshot"]
@@ -107,6 +107,7 @@ class Oneshot:
     def __init__(
         self,
         log_dir: str | None = None,
+        enable_compile: bool = False,
         **kwargs,
     ):
         """
@@ -157,6 +158,8 @@ class Oneshot:
                 f"{log_dir}/oneshot_{date_str}.log",
                 level="DEBUG",
             )
+
+        set_torch_compile(enable_compile)
 
         model_args, dataset_args, recipe_args, output_dir = parse_args(**kwargs)
 
@@ -402,17 +405,15 @@ def oneshot(
         Nothing is saved if None.
     :param log_dir: Path to save logs during oneshot run.
         Nothing is logged to file if None.
+    :param enable_compile: If True, use torch.compiled MSE observer inner loop
+        for faster calibration. Default False.
 
     :return: The calibrated PreTrainedModel
     """
 
-    set_torch_compile(enable_compile)
-
     # pass all args directly into Oneshot
     local_args = {
-        k: v
-        for k, v in locals().items()
-        if k not in ("local_args", "kwargs", "enable_compile")
+        k: v for k, v in locals().items() if k not in ("local_args", "kwargs")
     }
     one_shot = Oneshot(**local_args, **kwargs)
     one_shot()

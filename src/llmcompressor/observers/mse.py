@@ -1,10 +1,8 @@
-from typing import Optional
-
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch import distributed as dist
 
-from llmcompressor.observers.base import MinMaxTuple, Observer
+from llmcompressor.observers.base import Observer
 from llmcompressor.observers.helpers import lerp
 from llmcompressor.observers.mse_quant import _grid_search_mse
 
