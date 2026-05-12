@@ -107,7 +107,6 @@ class Oneshot:
     def __init__(
         self,
         log_dir: str | None = None,
-        enable_compile: bool = False,
         **kwargs,
     ):
         """
