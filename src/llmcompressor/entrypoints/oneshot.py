@@ -24,7 +24,6 @@ from llmcompressor.datasets import get_calibration_dataloader
 from llmcompressor.entrypoints.utils import post_process, pre_process
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.modeling.offset_norm import norm_calibration_context
-from llmcompressor.observers.mse_quant import set_torch_compile
 from llmcompressor.pipelines import CalibrationPipeline
 
 __all__ = ["Oneshot", "oneshot"]
@@ -158,8 +157,6 @@ class Oneshot:
                 level="DEBUG",
             )
 
-        set_torch_compile(enable_compile)
-
         model_args, dataset_args, recipe_args, output_dir = parse_args(**kwargs)
 
         self.model_args = model_args
@@ -235,6 +232,8 @@ class Oneshot:
                 calib_data=calibration_dataloader,
                 sequential_targets=self.dataset_args.sequential_targets,
             )
+
+            session.state.enable_compile = self.dataset_args.enable_compile
 
             user_pipeline = self.dataset_args.pipeline
             pipeline = CalibrationPipeline.from_modifiers(
