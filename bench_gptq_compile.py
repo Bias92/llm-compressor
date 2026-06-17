@@ -62,21 +62,21 @@ def _guard_env():
 
 
 def _recipe(strategy: str, group_size: int, activation: bool) -> str:
-    acts = (
-        """
-                        input_activations:
-                            num_bits: 8
-                            type: "int"
-                            symmetric: true
-                            strategy: "tensor"
-                            dynamic: false
-        """
-        if activation
+    # NOTE: YAML indentation is significant. weights keys sit at 24 spaces;
+    # input_activations is a sibling of weights at 20 spaces.
+    gs = (
+        f"\n                        group_size: {group_size}"
+        if strategy == "group"
         else ""
     )
-    gs = (
-        f"\n                            group_size: {group_size}"
-        if strategy == "group"
+    acts = (
+        "\n                    input_activations:"
+        "\n                        num_bits: 8"
+        "\n                        type: \"int\""
+        "\n                        symmetric: true"
+        "\n                        strategy: \"tensor\""
+        "\n                        dynamic: false"
+        if activation
         else ""
     )
     return f"""
@@ -91,8 +91,7 @@ quant_stage:
                         num_bits: 4
                         type: "int"
                         symmetric: true
-                        strategy: "{strategy}"{gs}
-{acts}
+                        strategy: "{strategy}"{gs}{acts}
     """
 
 
