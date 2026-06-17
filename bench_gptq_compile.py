@@ -42,8 +42,16 @@ import torch
 # (mirrors observers/mse_quant.py's set_torch_compile convention).
 from llmcompressor.modifiers.gptq.gptq_quantize import (
     get_gptq_compile,
+    set_gptq_block_compile,
     set_gptq_compile,
 )
+
+
+def _set_mode(enable: bool, mode: str):
+    """eager (enable=False), or compiled via 'column' (per-column fake_quantize)
+    or 'block' (whole inner loop). Resets both flags each call."""
+    set_gptq_compile(enable and mode == "column")
+    set_gptq_block_compile(enable and mode == "block")
 
 
 def _guard_env():
@@ -122,13 +130,16 @@ def _prep(model_id: str, num_samples: int, max_seq_len: int):
     return tokenizer, ds
 
 
-def _run_oneshot(model_id, ds, tokenizer, recipe, num_samples, max_seq_len, enable):
+def _run_oneshot(
+    model_id, ds, tokenizer, recipe, num_samples, max_seq_len, enable, mode="column"
+):
     from transformers import AutoModelForCausalLM
 
     from llmcompressor import oneshot
 
-    set_gptq_compile(enable)
-    assert get_gptq_compile() is enable, "compile flag did not flip"
+    _set_mode(enable, mode)
+    if mode == "column":
+        assert get_gptq_compile() is enable, "compile flag did not flip"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype="auto", device_map="auto"
@@ -183,7 +194,7 @@ def cmd_bench(args):
     label = (
         f"{args.model} | {args.strategy}"
         f"{'+act' if args.activation else ' (weight-only)'} | "
-        f"seq={args.max_seq_len} n={args.num_samples}"
+        f"seq={args.max_seq_len} n={args.num_samples} | compile-mode={args.mode}"
     )
     print("=" * 72)
     print(label)
@@ -199,7 +210,7 @@ def cmd_bench(args):
         for i in range(n):
             t, m = _run_oneshot(
                 args.model, ds, tokenizer, recipe,
-                args.num_samples, args.max_seq_len, enable,
+                args.num_samples, args.max_seq_len, enable, args.mode,
             )
             times.append(t)
             mems.append(m)
@@ -253,6 +264,13 @@ def main():
 
     b = sub.add_parser("bench", parents=[common])
     b.add_argument("--runs", type=int, default=3)
+    b.add_argument(
+        "--mode",
+        choices=["column", "block"],
+        default="column",
+        help="compiled path: 'column' (per-column fake_quantize) or "
+        "'block' (whole inner loop, Stage-2). compared against eager.",
+    )
     b.set_defaults(func=cmd_bench)
 
     args = p.parse_args()
