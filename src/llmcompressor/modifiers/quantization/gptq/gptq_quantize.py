@@ -2,6 +2,7 @@ import math
 from copy import copy
 
 import torch
+import torch._dynamo.config
 import transformers
 from compressed_tensors.quantization import (
     ActivationOrdering,
@@ -14,9 +15,15 @@ from loguru import logger
 
 from llmcompressor.modifiers.utils import SPARSITY_THRESHOLD
 from llmcompressor.observers.base import Observer
+from llmcompressor.observers.compile_config import get_gptq_compile
 from llmcompressor.pytorch.utils.helpers import tensor_sparsity
 
 GPTQ_PRECISION = torch.float32
+
+# Allow torch.compile to handle scalar conversions inside compressed_tensors'
+# calculate_qparams (e.g. float(bit_range)). Same approach as the MSE observer
+# compile path (observers/mse.py).
+torch._dynamo.config.capture_scalar_outputs = True
 
 __all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
 
@@ -66,6 +73,34 @@ def accumulate_hessian(
     H += inp.matmul(inp.t())
 
     return H, num_samples
+
+
+def _quantize_column(
+    column: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    quant_args: QuantizationArgs,
+    global_scale: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Fake-quantize a single weight column.
+
+    Extracted as a module-level function so it can be wrapped by ``torch.compile``.
+    All quantization-strategy branching and qparam slicing happens in the eager
+    caller, so this kernel always receives channel-shaped ``(scale, zero_point)``
+    and a matching ``quant_args`` and stays branch-free. It delegates to
+    ``fake_quantize`` rather than inlining the quant/dequant math, which keeps
+    ``global_scale`` and every strategy numerically identical to the eager path.
+    """
+    return fake_quantize(
+        column, scale, zero_point, quant_args, global_scale=global_scale
+    )
+
+
+# Compiled variant of the per-column kernel. The outer GPTQ block/column loop
+# stays eager to preserve the sequential error-feedback recurrence and the
+# Cholesky inverse (data-dependent control flow).
+_quantize_column_compiled = torch.compile(_quantize_column, dynamic=True)
 
 
 def quantize_weight(
@@ -175,6 +210,26 @@ def quantize_weight(
         )
         Hinv = H = torch.eye(num_columns, dtype=H.dtype, device=H.device)
 
+    # Select the compiled or eager per-column kernel once. The flag is a global
+    # set by the oneshot entrypoint and read here at call time (see
+    # observers/compile_config.py), avoiding threading it through modifier layers.
+    quantize_column = (
+        _quantize_column_compiled if get_gptq_compile() else _quantize_column
+    )
+
+    # Pre-build the per-column quantization args once, instead of copying per
+    # column inside the loop (which both allocates and breaks the compile graph).
+    # For GROUP/TENSOR_GROUP each column is quantized as a channelwise slice.
+    if strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
+        column_quant_args = copy(quant_args)
+        column_quant_args.strategy = QuantizationStrategy.CHANNEL
+    elif strategy in (QuantizationStrategy.TENSOR, QuantizationStrategy.CHANNEL):
+        column_quant_args = quant_args
+    else:
+        raise ValueError(
+            f"Quantization strategy is not supported for GPTQ: {strategy}"
+        )
+
     # See section 3.4 of https://arxiv.org/abs/2203.07259
     for i1 in range(0, num_columns, blocksize):
         i2 = min(i1 + blocksize, num_columns)
@@ -194,44 +249,25 @@ def quantize_weight(
             d = Hinv1[i, i]
             q = w.clone()
 
-            # quantize column
+            # select the channel-shaped qparams for this column (eager); the
+            # per-column slice is the only data-dependent part for GROUP
             if strategy == QuantizationStrategy.TENSOR:
-                q = fake_quantize(
-                    q, scale, zero_point, quant_args, global_scale=global_scale
-                )
+                col_scale, col_zero_point = scale, zero_point
             elif strategy == QuantizationStrategy.CHANNEL:
-                q = fake_quantize(
-                    q,
-                    scale[:, 0],
-                    zero_point[:, 0],
-                    quant_args,
-                    global_scale=global_scale,
-                )
-            # apply global scale to scale quant scale
-            elif strategy in (
-                QuantizationStrategy.GROUP,
-                QuantizationStrategy.TENSOR_GROUP,
-            ):
-                # get the group index for the current column
-                column_idx = i1 + i
-                group_index = g_idx[column_idx]
+                col_scale, col_zero_point = scale[:, 0], zero_point[:, 0]
+            else:  # GROUP / TENSOR_GROUP: quantize the column's group slice
+                group_index = g_idx[i1 + i]
+                col_scale = scale[:, group_index]
+                col_zero_point = zero_point[:, group_index]
 
-                # Since we're only applying quantization to a slice, this
-                # ends up being a channelwise application
-                altered_qargs = copy(quant_args)
-                altered_qargs.strategy = QuantizationStrategy.CHANNEL
-
-                q = fake_quantize(
-                    q,
-                    scale[:, group_index],
-                    zero_point[:, group_index],
-                    altered_qargs,
-                    global_scale=global_scale,
-                )
-            else:
-                raise ValueError(
-                    f"Quantization strategy is not supported for GPTQ: {strategy}"
-                )
+            # quantize column (compiled kernel if enabled)
+            q = quantize_column(
+                q,
+                col_scale,
+                col_zero_point,
+                column_quant_args,
+                global_scale=global_scale,
+            )
 
             # propagate column error
             Q1[:, i] = q
