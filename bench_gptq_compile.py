@@ -41,6 +41,7 @@ import torch
 # Modern branch: the GPTQ compile flag lives in the gptq module itself
 # (mirrors observers/mse_quant.py's set_torch_compile convention).
 from llmcompressor.modifiers.gptq.gptq_quantize import (
+    get_gptq_block_compile,
     get_gptq_compile,
     set_gptq_block_compile,
     set_gptq_compile,
@@ -138,8 +139,10 @@ def _run_oneshot(
     from llmcompressor import oneshot
 
     _set_mode(enable, mode)
-    if mode == "column":
-        assert get_gptq_compile() is enable, "compile flag did not flip"
+    # assert the flag for THIS mode actually flipped (so block bench can't
+    # silently measure the wrong path)
+    flag = get_gptq_compile() if mode == "column" else get_gptq_block_compile()
+    assert flag is enable, f"{mode} compile flag did not flip (got {flag})"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype="auto", device_map="auto"

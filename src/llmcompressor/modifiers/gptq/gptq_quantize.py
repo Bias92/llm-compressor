@@ -86,7 +86,7 @@ def _quantize_block(
     quant_args: QuantizationArgs,
     global_scale: torch.Tensor | None,
     count: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a whole block's columns in one call (Stage-2 compile target).
 
     Runs the full per-column GPTQ inner loop — fake_quantize + the sequential
@@ -94,9 +94,10 @@ def _quantize_block(
     iterations and fuse across them. The caller precomputes the per-column
     channel-shaped qparams (``scale_cols``/``zero_point_cols``, e.g.
     ``scale[:, g_idx[i1:i2]]`` for GROUP) so no data-dependent g_idx indexing
-    happens inside. ``W1`` is mutated in place (error feedback) and returned.
+    happens inside. ``W1`` is mutated in place for the recurrence but is dead
+    after this call (the block-error step uses Q1/Err1), so it isn't returned.
 
-    :return: (W1, Q1, Err1, losses1)
+    :return: (Q1, Err1, losses1)
     """
     Q1 = torch.zeros_like(W1)
     Err1 = torch.zeros_like(W1)
@@ -117,7 +118,7 @@ def _quantize_block(
         w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
         W1[:, i:] -= w1_err
         Err1[:, i] = err1
-    return W1, Q1, Err1, losses1
+    return Q1, Err1, losses1
 
 
 # Compiled variant of the whole-inner-loop kernel. dynamic=True because count
@@ -320,7 +321,7 @@ def quantize_weight(
             # precompute per-column channel qparams (vectorized g_idx gather),
             # then run the whole quant + error-feedback loop in one call
             cols = g_idx[i1:i2]
-            W1, Q1, Err1, losses1 = quantize_block(
+            Q1, Err1, losses1 = quantize_block(
                 W1,
                 Hinv1,
                 scale[:, cols],
