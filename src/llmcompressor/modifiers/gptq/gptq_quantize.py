@@ -31,6 +31,20 @@ def get_gptq_compile() -> bool:
     return _enable_gptq_compile
 
 
+# Stage-2 experiment: compile the whole per-column inner loop (quant +
+# error-feedback) as one helper, vs. just the per-column fake_quantize above.
+_enable_gptq_block_compile = False
+
+
+def set_gptq_block_compile(enabled: bool):
+    global _enable_gptq_block_compile
+    _enable_gptq_block_compile = enabled
+
+
+def get_gptq_block_compile() -> bool:
+    return _enable_gptq_block_compile
+
+
 # Allow torch.compile to handle scalar conversions inside compressed_tensors'
 # calculate_qparams (float(bit_range)). Same approach as the MSE observer
 # compile path (observers/mse_quant.py) and GPTQ commit a4f9ba2e.
@@ -62,6 +76,53 @@ def _quantize_column(
 # stays eager to preserve the sequential error-feedback recurrence and the
 # Cholesky inverse (data-dependent control flow).
 _quantize_column_compiled = torch.compile(_quantize_column, dynamic=True)
+
+
+def _quantize_block(
+    W1: torch.Tensor,
+    Hinv1: torch.Tensor,
+    scale_cols: torch.Tensor,
+    zero_point_cols: torch.Tensor,
+    quant_args: QuantizationArgs,
+    global_scale: torch.Tensor | None,
+    count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a whole block's columns in one call (Stage-2 compile target).
+
+    Runs the full per-column GPTQ inner loop — fake_quantize + the sequential
+    error-feedback recurrence — so torch.compile can unroll the ``count``
+    iterations and fuse across them. The caller precomputes the per-column
+    channel-shaped qparams (``scale_cols``/``zero_point_cols``, e.g.
+    ``scale[:, g_idx[i1:i2]]`` for GROUP) so no data-dependent g_idx indexing
+    happens inside. ``W1`` is mutated in place (error feedback) and returned.
+
+    :return: (W1, Q1, Err1, losses1)
+    """
+    Q1 = torch.zeros_like(W1)
+    Err1 = torch.zeros_like(W1)
+    losses1 = torch.zeros_like(W1)
+    for i in range(count):
+        w = W1[:, i]
+        d = Hinv1[i, i]
+        q = fake_quantize(
+            w,
+            scale_cols[:, i],
+            zero_point_cols[:, i],
+            quant_args,
+            global_scale=global_scale,
+        )
+        Q1[:, i] = q
+        losses1[:, i] = (w - q) ** 2 / d**2
+        err1 = (w - q) / d
+        w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+        W1[:, i:] -= w1_err
+        Err1[:, i] = err1
+    return W1, Q1, Err1, losses1
+
+
+# Compiled variant of the whole-inner-loop kernel. dynamic=True because count
+# (blocksize) and column dims vary; Dynamo unrolls the `count` loop.
+_quantize_block_compiled = torch.compile(_quantize_block, dynamic=True)
 
 
 def make_empty_hessian(
@@ -234,73 +295,103 @@ def quantize_weight(
     else:
         column_quant_args = quant_args
 
+    # Stage-2 path: compile the whole inner loop instead of just fake_quantize.
+    # Limited to GROUP/TENSOR_GROUP without sparsity for the first experiment
+    # (per-column scale gather is vectorizable; other strategies / preserve_zeros
+    # fall through to the proven per-column path).
+    block_mode = (
+        get_gptq_block_compile()
+        and strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP)
+        and not preserve_zeros
+    )
+    quantize_block = (
+        _quantize_block_compiled if get_gptq_block_compile() else _quantize_block
+    )
+
     # See section 3.4 of https://arxiv.org/abs/2203.07259
     for i1 in range(0, num_columns, blocksize):
         i2 = min(i1 + blocksize, num_columns)
         count = i2 - i1
 
         W1 = W[:, i1:i2].clone()
-        Q1 = torch.zeros_like(W1)
-        Err1 = torch.zeros_like(W1)
-        losses1 = torch.zeros_like(W1)
         Hinv1 = Hinv[i1:i2, i1:i2]
 
-        if preserve_zeros:
-            W1_nz_mask = W_nz_mask[:, i1:i2]
+        if block_mode:
+            # precompute per-column channel qparams (vectorized g_idx gather),
+            # then run the whole quant + error-feedback loop in one call
+            cols = g_idx[i1:i2]
+            W1, Q1, Err1, losses1 = quantize_block(
+                W1,
+                Hinv1,
+                scale[:, cols],
+                zero_point[:, cols],
+                column_quant_args,
+                global_scale,
+                count,
+            )
+        else:
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
+            losses1 = torch.zeros_like(W1)
 
-        for i in range(count):
-            w = W1[:, i]
-            d = Hinv1[i, i]
-            q = w.clone()
-
-            # select the channel-shaped qparams for this column (eager); the
-            # per-column slice is the only data-dependent part for GROUP/BLOCK.
-            # The quantize itself runs through the (compiled or eager) kernel.
-            if strategy == QuantizationStrategy.TENSOR:
-                q = quantize_column(
-                    q, scale, zero_point, column_quant_args, global_scale
-                )
-            elif strategy == QuantizationStrategy.CHANNEL:
-                q = quantize_column(
-                    q, scale[:, 0], zero_point[:, 0], column_quant_args, global_scale
-                )
-            elif strategy in (
-                QuantizationStrategy.GROUP,
-                QuantizationStrategy.TENSOR_GROUP,
-            ):
-                group_index = g_idx[i1 + i]
-                q = quantize_column(
-                    q,
-                    scale[:, group_index],
-                    zero_point[:, group_index],
-                    column_quant_args,
-                    global_scale,
-                )
-            elif strategy == QuantizationStrategy.BLOCK:
-                block_column_idx = g_idx[i1 + i]
-                q = quantize_column(
-                    q.unsqueeze(1),
-                    scale[:, block_column_idx : block_column_idx + 1],
-                    zero_point[:, block_column_idx : block_column_idx + 1],
-                    column_quant_args,
-                    global_scale,
-                ).squeeze(1)
-            else:
-                raise ValueError(
-                    f"Quantization strategy is not supported for GPTQ: {strategy}"
-                )
-
-            # propagate column error
-            Q1[:, i] = q
-            losses1[:, i] = (w - q) ** 2 / d**2
-
-            err1 = (w - q) / d
-            w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
             if preserve_zeros:
-                W1[:, i:] -= w1_err * W1_nz_mask[:, i:]
-            else:
-                W1[:, i:] -= w1_err
-            Err1[:, i] = err1
+                W1_nz_mask = W_nz_mask[:, i1:i2]
+
+            for i in range(count):
+                w = W1[:, i]
+                d = Hinv1[i, i]
+                q = w.clone()
+
+                # select the channel-shaped qparams for this column (eager)
+                if strategy == QuantizationStrategy.TENSOR:
+                    q = quantize_column(
+                        q, scale, zero_point, column_quant_args, global_scale
+                    )
+                elif strategy == QuantizationStrategy.CHANNEL:
+                    q = quantize_column(
+                        q,
+                        scale[:, 0],
+                        zero_point[:, 0],
+                        column_quant_args,
+                        global_scale,
+                    )
+                elif strategy in (
+                    QuantizationStrategy.GROUP,
+                    QuantizationStrategy.TENSOR_GROUP,
+                ):
+                    group_index = g_idx[i1 + i]
+                    q = quantize_column(
+                        q,
+                        scale[:, group_index],
+                        zero_point[:, group_index],
+                        column_quant_args,
+                        global_scale,
+                    )
+                elif strategy == QuantizationStrategy.BLOCK:
+                    block_column_idx = g_idx[i1 + i]
+                    q = quantize_column(
+                        q.unsqueeze(1),
+                        scale[:, block_column_idx : block_column_idx + 1],
+                        zero_point[:, block_column_idx : block_column_idx + 1],
+                        column_quant_args,
+                        global_scale,
+                    ).squeeze(1)
+                else:
+                    raise ValueError(
+                        f"Quantization strategy is not supported for GPTQ: {strategy}"
+                    )
+
+                # propagate column error
+                Q1[:, i] = q
+                losses1[:, i] = (w - q) ** 2 / d**2
+
+                err1 = (w - q) / d
+                w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                if preserve_zeros:
+                    W1[:, i:] -= w1_err * W1_nz_mask[:, i:]
+                else:
+                    W1[:, i:] -= w1_err
+                Err1[:, i] = err1
 
         # propagate block error
         W[:, i1:i2] = Q1
