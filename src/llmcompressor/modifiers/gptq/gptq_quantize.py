@@ -107,13 +107,11 @@ def _quantize_inner_loop(
     quant_args: QuantizationArgs,
     global_scale: torch.Tensor | None,
     g_idx: torch.Tensor | None,
-    W_nz_mask: torch.Tensor | None,
     losses: torch.Tensor,
     num_rows: int,
     num_columns: int,
     blocksize: int,
     strategy: QuantizationStrategy,
-    preserve_zeros: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # See section 3.4 of https://arxiv.org/abs/2203.07259
     for i1 in range(0, num_columns, blocksize):
@@ -123,36 +121,59 @@ def _quantize_inner_loop(
         W1 = W[:, i1:i2].clone()
         Hinv1 = Hinv[i1:i2, i1:i2]
 
-        if not preserve_zeros:
-            scale_cols, zero_point_cols = _get_scale_zero_point_cols(
-                strategy,
-                scale,
-                zero_point,
-                g_idx,
-                quant_args,
-                num_rows,
-                count,
-                i1,
-                i2,
-                W.device,
-            )
+        scale_cols, zero_point_cols = _get_scale_zero_point_cols(
+            strategy,
+            scale,
+            zero_point,
+            g_idx,
+            quant_args,
+            num_rows,
+            count,
+            i1,
+            i2,
+            W.device,
+        )
 
-            # _quantize_block mutates W1 during error propagation. W1 is not
-            # read after this call. Hinv1 is made contiguous so Dynamo does not
-            # specialize on the parent Hessian stride.
-            Q1, Err1, losses1 = _quantize_block(
-                W1,
-                Hinv1.contiguous(),
-                scale_cols,
-                zero_point_cols,
-                quant_args,
-                global_scale,
-                count,
-            )
-            W[:, i1:i2] = Q1
-            losses += torch.sum(losses1, 1) / 2
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            continue
+        # _quantize_block mutates W1 during error propagation. W1 is not
+        # read after this call. Hinv1 is made contiguous so Dynamo does not
+        # specialize on the parent Hessian stride.
+        Q1, Err1, losses1 = _quantize_block(
+            W1,
+            Hinv1.contiguous(),
+            scale_cols,
+            zero_point_cols,
+            quant_args,
+            global_scale,
+            count,
+        )
+        W[:, i1:i2] = Q1
+        losses += torch.sum(losses1, 1) / 2
+        W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+    return W, losses
+
+
+def _quantize_sparse_inner_loop(
+    W: torch.Tensor,
+    Hinv: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    quant_args: QuantizationArgs,
+    global_scale: torch.Tensor | None,
+    g_idx: torch.Tensor | None,
+    W_nz_mask: torch.Tensor,
+    losses: torch.Tensor,
+    num_columns: int,
+    blocksize: int,
+    strategy: QuantizationStrategy,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # See section 3.4 of https://arxiv.org/abs/2203.07259
+    for i1 in range(0, num_columns, blocksize):
+        i2 = min(i1 + blocksize, num_columns)
+        count = i2 - i1
+
+        W1 = W[:, i1:i2].clone()
+        Hinv1 = Hinv[i1:i2, i1:i2]
 
         Q1 = torch.zeros_like(W1)
         Err1 = torch.zeros_like(W1)
@@ -411,7 +432,7 @@ def quantize_weight(
 
     inner_loop = _get_quantize_inner_loop(use_compiled_loop)
     if preserve_zeros:
-        W, losses = inner_loop(
+        W, losses = _quantize_sparse_inner_loop(
             W,
             Hinv,
             scale,
@@ -421,11 +442,9 @@ def quantize_weight(
             g_idx,
             W_nz_mask,
             losses,
-            num_rows,
             num_columns,
             blocksize,
             strategy,
-            preserve_zeros,
         )
     else:
         with ExitStack() as stack:
@@ -444,13 +463,11 @@ def quantize_weight(
                 quant_args,
                 global_scale,
                 g_idx,
-                W_nz_mask,
                 losses,
                 num_rows,
                 num_columns,
                 blocksize,
                 strategy,
-                preserve_zeros,
             )
 
     if actorder:
