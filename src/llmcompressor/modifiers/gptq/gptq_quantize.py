@@ -1,4 +1,5 @@
 import math
+from contextlib import ExitStack
 from copy import copy
 
 import torch
@@ -56,7 +57,188 @@ def _quantize_block(
     return Q1, Err1, losses1
 
 
-_quantize_block_compiled = torch.compile(_quantize_block, dynamic=True)
+_quantize_inner_loop_compiled = None
+
+
+def _get_scale_zero_point_cols(
+    strategy: QuantizationStrategy,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    g_idx: torch.Tensor | None,
+    quant_args: QuantizationArgs,
+    num_rows: int,
+    count: int,
+    i1: int,
+    i2: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if strategy == QuantizationStrategy.TENSOR:
+        scale_cols = scale.expand(num_rows, count)
+        zero_point_cols = zero_point.expand(num_rows, count)
+    elif strategy == QuantizationStrategy.CHANNEL:
+        scale_cols = scale[:, :1].expand(-1, count)
+        zero_point_cols = zero_point[:, :1].expand(-1, count)
+    elif strategy in (
+        QuantizationStrategy.GROUP,
+        QuantizationStrategy.TENSOR_GROUP,
+    ):
+        cols = g_idx[i1:i2]
+        scale_cols = scale[:, cols]
+        zero_point_cols = zero_point[:, cols]
+    elif strategy == QuantizationStrategy.BLOCK:
+        row_block_size = quant_args.block_structure[0]
+        row_idx = (
+            torch.arange(num_rows, device=device, dtype=torch.int) // row_block_size
+        )
+        cols = g_idx[i1:i2]
+        scale_cols = scale[row_idx][:, cols]
+        zero_point_cols = zero_point[row_idx][:, cols]
+    else:
+        raise ValueError(f"Quantization strategy is not supported for GPTQ: {strategy}")
+
+    return scale_cols, zero_point_cols
+
+
+def _quantize_inner_loop(
+    W: torch.Tensor,
+    Hinv: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    quant_args: QuantizationArgs,
+    global_scale: torch.Tensor | None,
+    g_idx: torch.Tensor | None,
+    W_nz_mask: torch.Tensor | None,
+    losses: torch.Tensor,
+    num_rows: int,
+    num_columns: int,
+    blocksize: int,
+    strategy: QuantizationStrategy,
+    preserve_zeros: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # See section 3.4 of https://arxiv.org/abs/2203.07259
+    for i1 in range(0, num_columns, blocksize):
+        i2 = min(i1 + blocksize, num_columns)
+        count = i2 - i1
+
+        W1 = W[:, i1:i2].clone()
+        Hinv1 = Hinv[i1:i2, i1:i2]
+
+        if not preserve_zeros:
+            scale_cols, zero_point_cols = _get_scale_zero_point_cols(
+                strategy,
+                scale,
+                zero_point,
+                g_idx,
+                quant_args,
+                num_rows,
+                count,
+                i1,
+                i2,
+                W.device,
+            )
+
+            # _quantize_block mutates W1 during error propagation. W1 is not
+            # read after this call. Hinv1 is made contiguous so Dynamo does not
+            # specialize on the parent Hessian stride.
+            Q1, Err1, losses1 = _quantize_block(
+                W1,
+                Hinv1.contiguous(),
+                scale_cols,
+                zero_point_cols,
+                quant_args,
+                global_scale,
+                count,
+            )
+            W[:, i1:i2] = Q1
+            losses += torch.sum(losses1, 1) / 2
+            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            continue
+
+        Q1 = torch.zeros_like(W1)
+        Err1 = torch.zeros_like(W1)
+        losses1 = torch.zeros_like(W1)
+
+        W1_nz_mask = W_nz_mask[:, i1:i2]
+
+        for i in range(count):
+            w = W1[:, i]
+            d = Hinv1[i, i]
+            q = w.clone()
+
+            # quantize column
+            if strategy == QuantizationStrategy.TENSOR:
+                q = fake_quantize(
+                    q, scale, zero_point, quant_args, global_scale=global_scale
+                )
+            elif strategy == QuantizationStrategy.CHANNEL:
+                q = fake_quantize(
+                    q,
+                    scale[:, 0],
+                    zero_point[:, 0],
+                    quant_args,
+                    global_scale=global_scale,
+                )
+            # apply global scale to scale quant scale
+            elif strategy in (
+                QuantizationStrategy.GROUP,
+                QuantizationStrategy.TENSOR_GROUP,
+            ):
+                group_index = g_idx[i1 + i]
+                altered_args = copy(quant_args)
+                altered_args.strategy = QuantizationStrategy.CHANNEL
+                q = fake_quantize(
+                    q,
+                    scale[:, group_index],
+                    zero_point[:, group_index],
+                    altered_args,
+                    global_scale=global_scale,
+                )
+            elif strategy == QuantizationStrategy.BLOCK:
+                column_idx = i1 + i
+                block_column_idx = g_idx[column_idx]
+                q = fake_quantize(
+                    q.unsqueeze(1),
+                    scale[:, block_column_idx : block_column_idx + 1],
+                    zero_point[:, block_column_idx : block_column_idx + 1],
+                    quant_args,
+                    global_scale=global_scale,
+                ).squeeze(1)
+            else:
+                raise ValueError(
+                    f"Quantization strategy is not supported for GPTQ: {strategy}"
+                )
+
+            # propagate column error
+            Q1[:, i] = q
+            losses1[:, i] = (w - q) ** 2 / d**2
+
+            err1 = (w - q) / d
+            w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+            W1[:, i:] -= w1_err * W1_nz_mask[:, i:]
+            Err1[:, i] = err1
+
+        # propagate block error
+        W[:, i1:i2] = Q1
+        losses += torch.sum(losses1, 1) / 2
+
+        w_err = Err1.matmul(Hinv[i1:i2, i2:])
+        W[:, i2:] -= w_err * W_nz_mask[:, i2:]
+
+    return W, losses
+
+
+def _get_quantize_inner_loop(enable_compile: bool):
+    global _quantize_inner_loop_compiled
+
+    if not enable_compile:
+        return _quantize_inner_loop
+
+    if _quantize_inner_loop_compiled is None:
+        _quantize_inner_loop_compiled = torch.compile(
+            _quantize_inner_loop, dynamic=True
+        )
+
+    return _quantize_inner_loop_compiled
 
 
 def make_empty_hessian(
@@ -156,6 +338,7 @@ def quantize_weight(
         # use identity g_idx (invert permutation later)
 
     # handle g_idx
+    g_idx = None
     if strategy in (
         QuantizationStrategy.GROUP,
         QuantizationStrategy.TENSOR_GROUP,
@@ -213,7 +396,7 @@ def quantize_weight(
         )
         Hinv = H = torch.eye(num_columns, dtype=H.dtype, device=H.device)
 
-    use_compiled_block = (
+    use_compiled_loop = (
         active_session().state.enable_compile
         and strategy
         in (
@@ -226,139 +409,49 @@ def quantize_weight(
         and not preserve_zeros
     )
 
-    # See section 3.4 of https://arxiv.org/abs/2203.07259
-    for i1 in range(0, num_columns, blocksize):
-        i2 = min(i1 + blocksize, num_columns)
-        count = i2 - i1
-
-        W1 = W[:, i1:i2].clone()
-        Hinv1 = Hinv[i1:i2, i1:i2]
-
-        if use_compiled_block:
-            if strategy == QuantizationStrategy.TENSOR:
-                scale_cols = scale.expand(num_rows, count)
-                zero_point_cols = zero_point.expand(num_rows, count)
-            elif strategy == QuantizationStrategy.CHANNEL:
-                scale_cols = scale[:, :1].expand(-1, count)
-                zero_point_cols = zero_point[:, :1].expand(-1, count)
-            elif strategy in (
-                QuantizationStrategy.GROUP,
-                QuantizationStrategy.TENSOR_GROUP,
-            ):
-                cols = g_idx[i1:i2]
-                scale_cols = scale[:, cols]
-                zero_point_cols = zero_point[:, cols]
-            elif strategy == QuantizationStrategy.BLOCK:
-                row_block_size = quant_args.block_structure[0]
-                row_idx = (
-                    torch.arange(num_rows, device=W.device, dtype=torch.int)
-                    // row_block_size
+    inner_loop = _get_quantize_inner_loop(use_compiled_loop)
+    if preserve_zeros:
+        W, losses = inner_loop(
+            W,
+            Hinv,
+            scale,
+            zero_point,
+            quant_args,
+            global_scale,
+            g_idx,
+            W_nz_mask,
+            losses,
+            num_rows,
+            num_columns,
+            blocksize,
+            strategy,
+            preserve_zeros,
+        )
+    else:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch_attr(quant_args, "strategy", QuantizationStrategy.CHANNEL)
+            )
+            if use_compiled_loop:
+                stack.enter_context(
+                    torch._dynamo.config.patch(capture_scalar_outputs=True)
                 )
-                cols = g_idx[i1:i2]
-                scale_cols = scale[row_idx][:, cols]
-                zero_point_cols = zero_point[row_idx][:, cols]
-            else:
-                raise ValueError(
-                    f"Quantization strategy is not supported for GPTQ: {strategy}"
-                )
-
-            # _quantize_block mutates W1 during error propagation. W1 is not
-            # read after this call. Hinv1 is made contiguous so Dynamo does not
-            # specialize on the parent Hessian stride.
-            with (
-                patch_attr(quant_args, "strategy", QuantizationStrategy.CHANNEL),
-                torch._dynamo.config.patch(capture_scalar_outputs=True),
-            ):
-                Q1, Err1, losses1 = _quantize_block_compiled(
-                    W1,
-                    Hinv1.contiguous(),
-                    scale_cols,
-                    zero_point_cols,
-                    quant_args,
-                    global_scale,
-                    count,
-                )
-            W[:, i1:i2] = Q1
-            losses += torch.sum(losses1, 1) / 2
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            continue
-
-        Q1 = torch.zeros_like(W1)
-        Err1 = torch.zeros_like(W1)
-        losses1 = torch.zeros_like(W1)
-
-        if preserve_zeros:
-            W1_nz_mask = W_nz_mask[:, i1:i2]
-
-        for i in range(count):
-            w = W1[:, i]
-            d = Hinv1[i, i]
-            q = w.clone()
-
-            # quantize column
-            if strategy == QuantizationStrategy.TENSOR:
-                q = fake_quantize(
-                    q, scale, zero_point, quant_args, global_scale=global_scale
-                )
-            elif strategy == QuantizationStrategy.CHANNEL:
-                q = fake_quantize(
-                    q,
-                    scale[:, 0],
-                    zero_point[:, 0],
-                    quant_args,
-                    global_scale=global_scale,
-                )
-            # apply global scale to scale quant scale
-            elif strategy in (
-                QuantizationStrategy.GROUP,
-                QuantizationStrategy.TENSOR_GROUP,
-            ):
-                group_index = g_idx[i1 + i]
-                altered_args = copy(quant_args)
-                altered_args.strategy = QuantizationStrategy.CHANNEL
-                q = fake_quantize(
-                    q,
-                    scale[:, group_index],
-                    zero_point[:, group_index],
-                    altered_args,
-                    global_scale=global_scale,
-                )
-            elif strategy == QuantizationStrategy.BLOCK:
-                column_idx = i1 + i
-                block_column_idx = g_idx[column_idx]
-                q = fake_quantize(
-                    q.unsqueeze(1),
-                    scale[:, block_column_idx : block_column_idx + 1],
-                    zero_point[:, block_column_idx : block_column_idx + 1],
-                    quant_args,
-                    global_scale=global_scale,
-                ).squeeze(1)
-            else:
-                raise ValueError(
-                    f"Quantization strategy is not supported for GPTQ: {strategy}"
-                )
-
-            # propagate column error
-            Q1[:, i] = q
-            losses1[:, i] = (w - q) ** 2 / d**2
-
-            err1 = (w - q) / d
-            w1_err = err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-            if preserve_zeros:
-                W1[:, i:] -= w1_err * W1_nz_mask[:, i:]
-            else:
-                W1[:, i:] -= w1_err
-            Err1[:, i] = err1
-
-        # propagate block error
-        W[:, i1:i2] = Q1
-        losses += torch.sum(losses1, 1) / 2
-
-        w_err = Err1.matmul(Hinv[i1:i2, i2:])
-        if preserve_zeros:
-            W[:, i2:] -= w_err * W_nz_mask[:, i2:]
-        else:
-            W[:, i2:] -= w_err
+            W, losses = inner_loop(
+                W,
+                Hinv,
+                scale,
+                zero_point,
+                quant_args,
+                global_scale,
+                g_idx,
+                W_nz_mask,
+                losses,
+                num_rows,
+                num_columns,
+                blocksize,
+                strategy,
+                preserve_zeros,
+            )
 
     if actorder:
         # restore original permutation

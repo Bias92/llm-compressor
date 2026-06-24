@@ -57,7 +57,7 @@ def _make_group_quantize_inputs(device: str = "cpu"):
 @pytest.mark.parametrize(
     "strategy", ["tensor", "channel", "group", "tensor_group", "block"]
 )
-def test_quantize_weight_compiled_block_path_matches_eager(monkeypatch, strategy):
+def test_quantize_weight_compiled_inner_loop_matches_eager(monkeypatch, strategy):
     module, quant_args, hessian = _make_quantize_inputs(strategy)
 
     with create_session() as session:
@@ -71,12 +71,14 @@ def test_quantize_weight_compiled_block_path_matches_eager(monkeypatch, strategy
 
         calls = 0
 
-        def compiled_block(*args, **kwargs):
+        def compiled_inner_loop(*args, **kwargs):
             nonlocal calls
             calls += 1
-            return gptq_quantize._quantize_block(*args, **kwargs)
+            return gptq_quantize._quantize_inner_loop(*args, **kwargs)
 
-        monkeypatch.setattr(gptq_quantize, "_quantize_block_compiled", compiled_block)
+        monkeypatch.setattr(
+            gptq_quantize, "_quantize_inner_loop_compiled", compiled_inner_loop
+        )
 
         session.state.enable_compile = True
         compiled_loss, compiled_qparams = quantize_weight(
@@ -96,10 +98,12 @@ def test_quantize_weight_compiled_block_path_matches_eager(monkeypatch, strategy
 def test_quantize_weight_compile_flag_off_uses_eager(monkeypatch):
     module, quant_args, hessian = _make_group_quantize_inputs()
 
-    def compiled_block(*args, **kwargs):
-        raise AssertionError("compiled GPTQ block should not be used")
+    def compiled_inner_loop(*args, **kwargs):
+        raise AssertionError("compiled GPTQ inner loop should not be used")
 
-    monkeypatch.setattr(gptq_quantize, "_quantize_block_compiled", compiled_block)
+    monkeypatch.setattr(
+        gptq_quantize, "_quantize_inner_loop_compiled", compiled_inner_loop
+    )
 
     with create_session() as session:
         session.state.enable_compile = False
@@ -116,7 +120,7 @@ def test_quantize_weight_compile_flag_off_uses_eager(monkeypatch):
 
 @requires_compute_capability(8, 0)
 @torch.no_grad()
-def test_quantize_weight_runs_real_compiled_block_path():
+def test_quantize_weight_runs_real_compiled_inner_loop():
     module, quant_args, hessian = _make_group_quantize_inputs(device="cuda")
 
     with patch_attr(active_session().state, "enable_compile", True):
