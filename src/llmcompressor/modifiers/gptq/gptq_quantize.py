@@ -57,7 +57,7 @@ def _quantize_block(
     return Q1, Err1, losses1
 
 
-_quantize_inner_loop_compiled = None
+_quantize_block_body_compiled = None
 
 
 def _get_scale_zero_point_cols(
@@ -112,43 +112,79 @@ def _quantize_inner_loop(
     num_columns: int,
     blocksize: int,
     strategy: QuantizationStrategy,
+    enable_compile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # See section 3.4 of https://arxiv.org/abs/2203.07259
+    block_body = _get_quantize_block_body(enable_compile)
     for i1 in range(0, num_columns, blocksize):
         i2 = min(i1 + blocksize, num_columns)
         count = i2 - i1
 
-        W1 = W[:, i1:i2].clone()
-        Hinv1 = Hinv[i1:i2, i1:i2]
-
-        scale_cols, zero_point_cols = _get_scale_zero_point_cols(
-            strategy,
+        W, losses = block_body(
+            W,
+            Hinv,
             scale,
             zero_point,
-            g_idx,
             quant_args,
+            global_scale,
+            g_idx,
+            losses,
             num_rows,
             count,
             i1,
             i2,
-            W.device,
+            strategy,
         )
 
-        # _quantize_block mutates W1 during error propagation. W1 is not
-        # read after this call. Hinv1 is made contiguous so Dynamo does not
-        # specialize on the parent Hessian stride.
-        Q1, Err1, losses1 = _quantize_block(
-            W1,
-            Hinv1.contiguous(),
-            scale_cols,
-            zero_point_cols,
-            quant_args,
-            global_scale,
-            count,
-        )
-        W[:, i1:i2] = Q1
-        losses += torch.sum(losses1, 1) / 2
-        W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+    return W, losses
+
+
+def _quantize_block_body(
+    W: torch.Tensor,
+    Hinv: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    quant_args: QuantizationArgs,
+    global_scale: torch.Tensor | None,
+    g_idx: torch.Tensor | None,
+    losses: torch.Tensor,
+    num_rows: int,
+    count: int,
+    i1: int,
+    i2: int,
+    strategy: QuantizationStrategy,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    W1 = W[:, i1:i2].clone()
+    Hinv1 = Hinv[i1:i2, i1:i2]
+
+    scale_cols, zero_point_cols = _get_scale_zero_point_cols(
+        strategy,
+        scale,
+        zero_point,
+        g_idx,
+        quant_args,
+        num_rows,
+        count,
+        i1,
+        i2,
+        W.device,
+    )
+
+    # _quantize_block mutates W1 during error propagation. W1 is not
+    # read after this call. Hinv1 is made contiguous so Dynamo does not
+    # specialize on the parent Hessian stride.
+    Q1, Err1, losses1 = _quantize_block(
+        W1,
+        Hinv1.contiguous(),
+        scale_cols,
+        zero_point_cols,
+        quant_args,
+        global_scale,
+        count,
+    )
+    W[:, i1:i2] = Q1
+    losses += torch.sum(losses1, 1) / 2
+    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
     return W, losses
 
@@ -248,18 +284,18 @@ def _quantize_sparse_inner_loop(
     return W, losses
 
 
-def _get_quantize_inner_loop(enable_compile: bool):
-    global _quantize_inner_loop_compiled
+def _get_quantize_block_body(enable_compile: bool):
+    global _quantize_block_body_compiled
 
     if not enable_compile:
-        return _quantize_inner_loop
+        return _quantize_block_body
 
-    if _quantize_inner_loop_compiled is None:
-        _quantize_inner_loop_compiled = torch.compile(
-            _quantize_inner_loop, dynamic=True
+    if _quantize_block_body_compiled is None:
+        _quantize_block_body_compiled = torch.compile(
+            _quantize_block_body, dynamic=True
         )
 
-    return _quantize_inner_loop_compiled
+    return _quantize_block_body_compiled
 
 
 def make_empty_hessian(
@@ -430,7 +466,6 @@ def quantize_weight(
         and not preserve_zeros
     )
 
-    inner_loop = _get_quantize_inner_loop(use_compiled_loop)
     if preserve_zeros:
         W, losses = _quantize_sparse_inner_loop(
             W,
@@ -455,7 +490,7 @@ def quantize_weight(
                 stack.enter_context(
                     torch._dynamo.config.patch(capture_scalar_outputs=True)
                 )
-            W, losses = inner_loop(
+            W, losses = _quantize_inner_loop(
                 W,
                 Hinv,
                 scale,
@@ -468,6 +503,7 @@ def quantize_weight(
                 num_columns,
                 blocksize,
                 strategy,
+                use_compiled_loop,
             )
 
     if actorder:
