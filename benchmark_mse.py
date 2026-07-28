@@ -548,6 +548,14 @@ def _fused_grid_search_mindist_kernel(
     For each element, binary searches the sorted codebook to find the
     insertion point, then compares distances to the two adjacent codes.
     No cutoffs needed — just the codebook itself.
+
+    ``hi`` starts at ``num_codes - 1``, not ``num_codes``. The loop runs a
+    fixed ``LOG_C = ceil(log2(num_codes))`` iterations, which only converges
+    over a search space of ``num_codes`` candidates. Starting at
+    ``num_codes`` leaves ``num_codes + 1`` candidates and the search can end
+    one short: for 256 int8 codes, obs_norm in (-127.5, -127) returned -128
+    instead of -127, costing up to 35% regret on ~2.7% of groups. Adding a
+    ninth iteration instead would let a lane read ``codes[num_codes]``.
     """
     pid = tl.program_id(0)
     row = pid // num_groups
@@ -582,7 +590,7 @@ def _fused_grid_search_mindist_kernel(
 
             # Binary search for insertion point in sorted codes
             lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-            hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+            hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
             for _ in range(LOG_C):
                 mid = (lo + hi) >> 1
                 code_mid = tl.load(codes_ptr + mid)  # gather [BLOCK_G]
@@ -753,7 +761,7 @@ def _fused_grid_search_incr2_kernel(
             if step == 0:
                 # Full binary search for insertion point
                 lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                 for _ in range(LOG_C):
                     mid = (lo + hi) >> 1
                     code_mid = tl.load(codes_ptr + mid)
@@ -851,7 +859,7 @@ def _fused_grid_search_incr3_kernel(
 
             if step == 0:
                 lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                 for _ in range(LOG_C):
                     mid = (lo + hi) >> 1
                     code_mid = tl.load(codes_ptr + mid)
@@ -958,7 +966,7 @@ def _fused_grid_search_incr2_patience_kernel(
 
                 if step == 0:
                     lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                    hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                    hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                     for _ in range(LOG_C):
                         mid = (lo + hi) >> 1
                         code_mid = tl.load(codes_ptr + mid)
@@ -1117,7 +1125,7 @@ def _fused_grid_search_chunked_kernel(
 
                     if step == 0:
                         lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                        hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                        hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                         for _ in range(LOG_C):
                             mid = (lo + hi) >> 1
                             code_mid = tl.load(codes_ptr + mid)
@@ -1305,7 +1313,7 @@ def _fused_grid_search_incrN_patience_kernel(
 
                 if step == 0:
                     lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                    hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                    hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                     for _ in range(LOG_C):
                         mid = (lo + hi) >> 1
                         code_mid = tl.load(codes_ptr + mid)
@@ -1581,7 +1589,7 @@ def _fused_grid_search_multigroup_kernel(
                     obs_norm = obs / eff_scale
 
                     lo = tl.zeros([BLOCK_G], dtype=tl.int32)
-                    hi = tl.full([BLOCK_G], num_codes, dtype=tl.int32)
+                    hi = tl.full([BLOCK_G], num_codes - 1, dtype=tl.int32)
                     for _ in range(LOG_C):
                         mid = (lo + hi) >> 1
                         code_mid = tl.load(codes_ptr + mid)
