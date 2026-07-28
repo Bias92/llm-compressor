@@ -1878,24 +1878,29 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
     # Reference rows — these keep the production early stopping, so they are
     # NOT part of the correctness gate. They just show what the current eager
     # and compiled paths actually give up relative to the oracle.
-    print("\n--- reference (early stopping ON, not gated) ---")
+    no_patience = total_steps + 1
+
+    print("\n--- reference (not gated) ---")
     print(_QUALITY_HDR)
-    noise_floor = 0.0
-    for name, fn in [
-        ("eager(patience=%d)" % patience, grid_search_eager),
-        ("compiled(patience=%d)" % patience, grid_search_compiled),
+    for name, fn, pat in [
+        # production settings, for context
+        ("eager(patience=%d)" % patience, grid_search_eager, patience),
+        ("compiled(patience=%d)" % patience, grid_search_compiled, patience),
+        # same math as the oracle, full grid: whatever regret this shows is
+        # pure float reassociation, so it is the floor for every other row
+        ("compiled(full grid)", grid_search_compiled, no_patience),
     ]:
         bmin, bmax = fn(
-            observed, args, token_args, maxshrink, patience, grid, norm, chunk_size
+            observed, args, token_args, maxshrink, pat, grid, norm, chunk_size
         )
         m = _an(bmin, bmax)
         print(_fmt_quality(name, m))
-        if fn is grid_search_compiled:
+        if pat == no_patience:
             noise_floor = m["max_rel"]
     print(
-        f"compiled runs the same math as the oracle, so its {noise_floor:.3e} max "
-        "regret is the float-reassociation noise floor; regret at or below it "
-        "carries no information."
+        f"noise floor {noise_floor:.3e}: compiled over the full grid runs the "
+        "oracle's own math, so its regret is reassociation only. Regret at or "
+        "below this carries no information."
     )
 
     # Phase 0 — GATE. These variants search the whole grid with no bucket
@@ -1954,7 +1959,6 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
     # above the step count so the gate can never trigger.
     print("\n=== phase A: bucket approximation, patience OFF ===")
     print(_QUALITY_HDR)
-    no_patience = total_steps + 1
     for n in (1, 2, 3, 4):
         bmin, bmax, steps = _launch_incrN_patience(
             observed, args, maxshrink, no_patience, grid, norm, n, record_steps=True
