@@ -1395,9 +1395,15 @@ def _launch_incrN_patience(
     TOTAL_STEPS = triton.next_power_of_2(total_steps)
     grid_launch = (num_rows * num_groups,)
 
-    steps_run = torch.zeros(
-        num_rows, num_groups, dtype=torch.int32, device=observed.device
-    )
+    if record_steps:
+        steps_run = torch.zeros(
+            num_rows, num_groups, dtype=torch.int32, device=observed.device
+        )
+    else:
+        # RECORD_STEPS=False compiles the store away, so the pointer is never
+        # dereferenced. Reuse an existing buffer rather than allocating, so the
+        # timing path does no extra work at all.
+        steps_run = best_step
 
     _fused_grid_search_incrN_patience_kernel[grid_launch](
         observed_contig, scale_base, codes,
@@ -1841,7 +1847,7 @@ def _fmt_quality(name, m, steps=None):
 
 
 def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
-                chunk_size, n_override, patience_sweep):
+                chunk_size, n_override, patience_sweep, gate_rtol, force):
     """Quality-only pass: no timing, so diagnostics cannot skew latency."""
     total_steps = int(maxshrink * grid)
 
@@ -1858,25 +1864,33 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
         f"max {ties.max().item():.0f}"
     )
 
-    n_derived, detail = derive_num_buckets(args, grid, maxshrink)
-    if n_derived is None:
-        print(f"\nderived N: unsupported — {detail}")
-    else:
-        print(f"\nderived N = {n_derived}   ({detail})")
-    n_sel = n_override if n_override is not None else (n_derived or 1)
-    print(f"using N = {n_sel}" + (" (--n-buckets override)" if n_override else ""))
-
     def _an(bmin, bmax):
         return analyze(bmin, bmax, observed, args, token_args, norm, oracle)
 
-    # Phase 0 — full-grid variants. These do no bucket approximation and no
-    # early stopping, so any regret here comes from the codebook /
-    # scale_base*p linearisation itself.
-    print("\n=== phase 0: full-grid (isolates codebook + linearised scale) ===")
+    # Reference rows — these keep the production early stopping, so they are
+    # NOT part of the correctness gate. They just show what the current eager
+    # and compiled paths actually give up relative to the oracle.
+    print("\n--- reference (early stopping ON, not gated) ---")
     print(_QUALITY_HDR)
     for name, fn in [
-        ("eager(+patience)", grid_search_eager),
-        ("compiled", grid_search_compiled),
+        ("eager(patience=%d)" % patience, grid_search_eager),
+        ("compiled(patience=%d)" % patience, grid_search_compiled),
+    ]:
+        bmin, bmax = fn(
+            observed, args, token_args, maxshrink, patience, grid, norm, chunk_size
+        )
+        print(_fmt_quality(name, _an(bmin, bmax)))
+
+    # Phase 0 — GATE. These variants search the whole grid with no bucket
+    # approximation and no early stopping, so they should reproduce the oracle
+    # exactly. Any regret here is an equivalence failure of the codebook path
+    # as a whole (binning, rounding ties, the linearised scale_base*p, the
+    # dropped zero_point, Triton reduction order) and has to be fixed before
+    # tuning N or patience means anything.
+    print("\n=== phase 0 GATE: full-grid variants must match the oracle ===")
+    print(_QUALITY_HDR)
+    gate_failures = []
+    for name, fn in [
         ("triton", grid_search_triton),
         ("triton_cutoff", grid_search_triton_cutoff),
         ("triton_mindist", grid_search_triton_mindist),
@@ -1885,7 +1899,39 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
         bmin, bmax = fn(
             observed, args, token_args, maxshrink, patience, grid, norm, chunk_size
         )
-        print(_fmt_quality(name, _an(bmin, bmax)))
+        m = _an(bmin, bmax)
+        print(_fmt_quality(name, m))
+        if m["max_rel"] > gate_rtol:
+            gate_failures.append((name, m["max_rel"], m["worse_pct"]))
+
+    if gate_failures:
+        print(f"\nGATE FAILED (max regret > {gate_rtol:g}):")
+        for name, mx, wp in gate_failures:
+            print(f"  {name}: max regret {mx:.3e}, {wp:.2f}% of groups worse")
+        print(
+            "\nThe full-grid codebook path does not reproduce the oracle, so N "
+            "and patience tuning would be measured on top of an existing error."
+            "\nFix the equivalence first, or pass --force to continue anyway."
+        )
+        if not force:
+            return
+        print("--force given: continuing despite gate failure.\n")
+    else:
+        print(f"\nGATE PASSED (all max regret <= {gate_rtol:g})")
+
+    n_derived, detail = derive_num_buckets(args, grid, maxshrink)
+    if n_derived is None:
+        print(f"\nderived N: UNSUPPORTED — {detail}")
+        if n_override is None:
+            print(
+                "Refusing to guess N for an unsupported configuration. "
+                "Pass --n-buckets explicitly if you want to probe it anyway."
+            )
+            return
+    else:
+        print(f"\nderived N = {n_derived}   ({detail})")
+    n_sel = n_override if n_override is not None else n_derived
+    print(f"using N = {n_sel}" + (" (--n-buckets override)" if n_override else ""))
 
     # Phase A — bucket approximation only. Patience is disabled by setting it
     # above the step count so the gate can never trigger.
@@ -2027,6 +2073,18 @@ def main():
         default=[15, 10, 5],
         help="patience values to sweep in --quality phase B",
     )
+    parser.add_argument(
+        "--gate-rtol",
+        type=float,
+        default=1e-6,
+        help="max relative regret a full-grid variant may show before the "
+        "phase 0 gate fails",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="continue past a failed phase 0 gate",
+    )
     args = parser.parse_args()
 
     total_steps = int(args.maxshrink * args.grid)
@@ -2056,6 +2114,7 @@ def main():
             observed, quant_args, token_args,
             args.maxshrink, args.patience, args.grid, args.norm,
             args.chunk_size, args.n_buckets, args.patience_sweep,
+            args.gate_rtol, args.force,
         )
         return
 
