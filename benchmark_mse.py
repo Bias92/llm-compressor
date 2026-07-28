@@ -1825,19 +1825,20 @@ def analyze(bmin, bmax, observed, args, token_args, norm, oracle, rtol=1e-6):
     return {
         "mean_rel": rel.clamp_min(0).mean().item(),
         "max_rel": rel.max().item(),
+        "worse_n": int(worse.sum().item()),
+        "total_n": worse.numel(),
         "worse_pct": worse.float().mean().item() * 100.0,
-        "match_pct": (~worse).float().mean().item() * 100.0,
         "same_step_pct": same_step.float().mean().item() * 100.0,
     }
 
 
 _QUALITY_HDR = (
-    f"{'variant':>22} {'mean_regret':>12} {'max_regret':>12} "
-    f"{'worse%':>8} {'match%':>8} {'same_step%':>11} {'steps med/p95/max':>18}"
+    f"{'variant':>21} {'mean_regret':>12} {'max_regret':>12} "
+    f"{'worse/total':>16} {'same_step%':>11} {'steps m/p95/mx':>15} {'ms':>8}"
 )
 
 
-def _fmt_quality(name, m, steps=None):
+def _fmt_quality(name, m, steps=None, ms=None):
     if steps is None:
         s = "-"
     else:
@@ -1847,11 +1848,31 @@ def _fmt_quality(name, m, steps=None):
             f"{f.quantile(0.95).item():.0f}/"
             f"{f.max().item():.0f}"
         )
+    # raw counts, because a handful of bad groups rounds to 0.00%
+    wt = f"{m['worse_n']}/{m['total_n']}"
+    t = "-" if ms is None else f"{ms * 1e3:.2f}"
     return (
-        f"{name:>22} {m['mean_rel']:>12.3e} {m['max_rel']:>12.3e} "
-        f"{m['worse_pct']:>8.2f} {m['match_pct']:>8.2f} "
-        f"{m['same_step_pct']:>11.2f} {s:>18}"
+        f"{name:>21} {m['mean_rel']:>12.3e} {m['max_rel']:>12.3e} "
+        f"{wt:>16} {m['same_step_pct']:>11.2f} {s:>15} {t:>8}"
     )
+
+
+def _time_launch(fn, warmup=2, iters=5):
+    """Median wall time of ``fn``. Run separately from the quality pass."""
+    for _ in range(warmup):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+    return sorted(times)[len(times) // 2]
 
 
 def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
@@ -1924,12 +1945,12 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
         m = _an(bmin, bmax)
         print(_fmt_quality(name, m))
         if m["max_rel"] > gate_rtol:
-            gate_failures.append((name, m["max_rel"], m["worse_pct"]))
+            gate_failures.append((name, m["max_rel"], m["worse_n"], m["total_n"]))
 
     if gate_failures:
         print(f"\nGATE FAILED (max regret > {gate_rtol:g}):")
-        for name, mx, wp in gate_failures:
-            print(f"  {name}: max regret {mx:.3e}, {wp:.2f}% of groups worse")
+        for name, mx, wn, tn in gate_failures:
+            print(f"  {name}: max regret {mx:.3e}, {wn}/{tn} groups worse")
         print(
             "\nThe full-grid codebook path does not reproduce the oracle, so N "
             "and patience tuning would be measured on top of an existing error."
@@ -1957,29 +1978,42 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
 
     # Phase A — bucket approximation only. Patience is disabled by setting it
     # above the step count so the gate can never trigger.
+    def _probe(n, pat):
+        """Quality once with instrumentation, then timing without it."""
+        bmin, bmax, steps = _launch_incrN_patience(
+            observed, args, maxshrink, pat, grid, norm, n, record_steps=True
+        )
+        ms = _time_launch(
+            lambda: _launch_incrN_patience(
+                observed, args, maxshrink, pat, grid, norm, n
+            )
+        )
+        return _an(bmin, bmax), steps, ms
+
     print("\n=== phase A: bucket approximation, patience OFF ===")
     print(_QUALITY_HDR)
     for n in (1, 2, 3, 4):
-        bmin, bmax, steps = _launch_incrN_patience(
-            observed, args, maxshrink, no_patience, grid, norm, n, record_steps=True
-        )
-        print(_fmt_quality(f"N={n} patience=off", _an(bmin, bmax), steps))
+        m, steps, ms = _probe(n, no_patience)
+        print(_fmt_quality(f"N={n} patience=off", m, steps, ms))
 
-    # Phase B — early stopping only, at the selected N.
+    # Phase B — early stopping only, at the selected N. Timing is measured
+    # here too: a patience that costs accuracy has to be judged against the
+    # speed it actually buys.
     print(f"\n=== phase B: patience sweep at N={n_sel} ===")
     print(_QUALITY_HDR)
     for pat in [no_patience] + list(patience_sweep):
-        bmin, bmax, steps = _launch_incrN_patience(
-            observed, args, maxshrink, pat, grid, norm, n_sel, record_steps=True
-        )
+        m, steps, ms = _probe(n_sel, pat)
         label = "off" if pat == no_patience else str(pat)
-        print(_fmt_quality(f"N={n_sel} patience={label}", _an(bmin, bmax), steps))
+        print(_fmt_quality(f"N={n_sel} patience={label}", m, steps, ms))
 
     print(
         "\nregret = (variant error - oracle best error) / oracle best error, "
         "recomputed via calculate_qparams + fake_quantize."
-        "\nmatch% counts groups within rtol of the oracle best (tie-aware); "
-        "same_step% is informational only."
+        "\nworse/total counts groups beyond rtol of the oracle best, as raw "
+        "counts because a few bad groups out of 131072 round to 0.00%. The "
+        "check is tie-aware: a different step with equal error is not a miss."
+        "\nsame_step% is informational. ms is a separate timed pass with the "
+        "step instrumentation off."
     )
 
 
