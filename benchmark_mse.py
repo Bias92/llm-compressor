@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import math
 import time
 
 import torch
@@ -1239,6 +1240,7 @@ def _fused_grid_search_incrN_patience_kernel(
     codes_ptr,
     best_step_ptr,
     best_error_ptr,
+    steps_run_ptr,
     num_rows,
     num_groups,
     group_size,
@@ -1253,11 +1255,16 @@ def _fused_grid_search_incrN_patience_kernel(
     LOG_C: tl.constexpr,
     TOTAL_STEPS: tl.constexpr,
     NUM_NEIGHBORS: tl.constexpr,
+    RECORD_STEPS: tl.constexpr,
 ):
     """Incremental search with variable neighbor count and early stopping.
 
     NUM_NEIGHBORS controls how many codes to check in the shift direction
     after the initial binary search at step 0.
+
+    RECORD_STEPS is a compile-time flag; when False the steps_run store is
+    eliminated at compile time, so the timing path generates the same code
+    as before this instrumentation was added.
     """
     pid = tl.program_id(0)
     row = pid // num_groups
@@ -1286,10 +1293,12 @@ def _fused_grid_search_incrN_patience_kernel(
     best_s = 0
     bin_idx = tl.zeros([BLOCK_G], dtype=tl.int32)
     patience_ctr = 0
+    steps_run = 0
 
     for step in range(TOTAL_STEPS):
         if step < total_steps:
             if patience_ctr < patience:
+                steps_run += 1
                 p = (1.0 - step * ig).to(tl.float32)
                 eff_scale = tl.maximum(scale_base * p, 1e-38).to(tl.float32)
                 obs_norm = obs / eff_scale
@@ -1339,10 +1348,21 @@ def _fused_grid_search_incrN_patience_kernel(
 
     tl.store(best_step_ptr + row * num_groups + group, best_s)
     tl.store(best_error_ptr + row * num_groups + group, best_err)
+    if RECORD_STEPS:
+        tl.store(steps_run_ptr + row * num_groups + group, steps_run)
 
 
-def _launch_incrN_patience(observed, args, maxshrink, patience, grid, norm, num_neighbors):
-    """Shared launcher for incrN patience kernel with variable neighbor count."""
+def _launch_incrN_patience(
+    observed, args, maxshrink, patience, grid, norm, num_neighbors,
+    record_steps=False,
+):
+    """Shared launcher for incrN patience kernel with variable neighbor count.
+
+    ``record_steps=True`` additionally returns the per-program count of grid
+    steps actually executed before early stopping. The store is guarded by a
+    ``tl.constexpr`` so the timing path (record_steps=False) compiles to the
+    same code as without the instrumentation.
+    """
     import math
 
     min_val = torch.amin(observed, dim=(0, -1))
@@ -1375,14 +1395,18 @@ def _launch_incrN_patience(observed, args, maxshrink, patience, grid, norm, num_
     TOTAL_STEPS = triton.next_power_of_2(total_steps)
     grid_launch = (num_rows * num_groups,)
 
+    steps_run = torch.zeros(
+        num_rows, num_groups, dtype=torch.int32, device=observed.device
+    )
+
     _fused_grid_search_incrN_patience_kernel[grid_launch](
         observed_contig, scale_base, codes,
-        best_step, best_error,
+        best_step, best_error, steps_run,
         num_rows, num_groups, group_size, total_steps, num_codes,
         observed_contig.stride(1), observed_contig.stride(2),
         1.0 / grid, norm, patience,
         BLOCK_G=BLOCK_G, LOG_C=LOG_C, TOTAL_STEPS=TOTAL_STEPS,
-        NUM_NEIGHBORS=num_neighbors,
+        NUM_NEIGHBORS=num_neighbors, RECORD_STEPS=record_steps,
     )
 
     ps = torch.tensor(
@@ -1390,7 +1414,10 @@ def _launch_incrN_patience(observed, args, maxshrink, patience, grid, norm, num_
         dtype=min_val.dtype, device=min_val.device,
     )
     best_p = ps[best_step.long()]
-    return min_val * best_p, max_val * best_p
+    bmin, bmax = min_val * best_p, max_val * best_p
+    if record_steps:
+        return bmin, bmax, steps_run
+    return bmin, bmax
 
 
 def grid_search_triton_incrNp1(
@@ -1655,6 +1682,240 @@ def grid_search_triton_multigroup(
     return best_min_val, best_max_val
 
 
+# ── Quality diagnostics ──────────────────────────────────────────────────────
+#
+# Everything below is only used by --quality. It never runs inside the timed
+# loop, so latency measurements are unaffected.
+
+
+def exact_error(observed, args, token_args, min_v, max_v, norm):
+    """Per-group quantization error for a candidate min/max range.
+
+    Recomputed through the real ``calculate_qparams`` + ``fake_quantize``
+    path (identical to ``_calculate_error`` in mse_quant.py), so it is
+    comparable across every variant regardless of how that variant
+    internally approximates the quantization.
+    """
+    scales, zps = calculate_qparams(
+        min_vals=min_v,
+        max_vals=max_v,
+        quantization_args=args,
+        global_scale=None,
+    )
+    q = fake_quantize(
+        observed, scales.unsqueeze(-1), zps.unsqueeze(-1), token_args
+    ).to(observed.dtype)
+    return torch.sum((q - observed).abs().pow(norm), dim=(0, -1))
+
+
+def build_oracle(observed, args, token_args, maxshrink, grid, norm):
+    """Eager full-grid search with NO early stopping — the ground truth.
+
+    Evaluates every shrink step through the exact error path and keeps the
+    full error tensor so ties can be detected.
+
+    :return: dict with per-step errors, the per-group minimum, its argmin,
+        the unshrunk min/max, and the shrink factors.
+    """
+    min_val = torch.amin(observed, dim=(0, -1))
+    max_val = torch.amax(observed, dim=(0, -1))
+    total_steps = int(maxshrink * grid)
+
+    errs = []
+    for i in range(total_steps):
+        p = 1 - i / grid
+        errs.append(
+            exact_error(observed, args, token_args, min_val * p, max_val * p, norm)
+        )
+    errs = torch.stack(errs)  # (steps, *qparams_shape)
+
+    best_error, best_step = errs.min(dim=0)
+    ps = torch.tensor(
+        [1.0 - i / grid for i in range(total_steps)],
+        dtype=min_val.dtype,
+        device=min_val.device,
+    )
+    return {
+        "errs": errs,
+        "best_error": best_error,
+        "best_step": best_step,
+        "min_val": min_val,
+        "max_val": max_val,
+        "ps": ps,
+        "total_steps": total_steps,
+    }
+
+
+def derive_num_buckets(args, grid, maxshrink):
+    """Number of codebook buckets an element can shift by in one grid step.
+
+    As ``p`` shrinks, ``obs_norm = obs / (scale * p) + zp`` moves away from
+    ``zp`` by a factor ``1/p`` per step, so the largest index shift is
+
+        N = ceil( R / (grid * p_min) ),  R = max(|q_min - zp|, |q_max - zp|)
+
+    with ``p_min = 1 - maxshrink`` as the conservative bound. This is a
+    *uniform-integer* bound: it assumes evenly spaced codes. Irregular
+    codebooks (FP4/FP8) must derive N from their actual cutoff spacing
+    instead.
+
+    :return: (N, detail-string) or (None, reason) when unsupported.
+    """
+    q_type = str(getattr(args, "type", "int")).lower()
+    if "int" not in q_type:
+        return None, (
+            f"non-integer type ({q_type}): irregular codebook, "
+            "derive N from actual cutoffs"
+        )
+    if not args.symmetric:
+        # zero_point is data dependent and the scratch codebook path does not
+        # apply it at all, so asymmetric is not supported here yet.
+        return None, "asymmetric: codebook path ignores zero_point, unsupported"
+
+    zp = 0
+    q_min = -(2 ** (args.num_bits - 1))
+    q_max = 2 ** (args.num_bits - 1) - 1
+    R = max(abs(q_min - zp), abs(q_max - zp))
+    p_min = 1.0 - maxshrink
+    n = math.ceil(R / (grid * p_min))
+    return n, f"R={R} q=[{q_min},{q_max}] zp={zp} grid={grid:g} p_min={p_min:.2f}"
+
+
+def analyze(bmin, bmax, observed, args, token_args, norm, oracle, rtol=1e-6):
+    """Compare a variant's chosen range against the oracle.
+
+    ``regret`` is the primary metric: how much worse the variant's *actual*
+    quantization error is than the best achievable on the grid. Step-index
+    agreement is reported separately and is only informational, since
+    several steps can produce identical error.
+    """
+    v_err = exact_error(observed, args, token_args, bmin, bmax, norm)
+    best = oracle["best_error"]
+
+    denom = best.abs().clamp_min(torch.finfo(best.dtype).tiny)
+    rel = (v_err - best) / denom
+    worse = rel > rtol
+
+    # informational: did it land on the same step index the oracle picked?
+    min_val, max_val, ps = oracle["min_val"], oracle["max_val"], oracle["ps"]
+    use_min = min_val.abs() >= max_val.abs()
+    denom_p = torch.where(use_min, min_val, max_val)
+    numer_p = torch.where(use_min, bmin, bmax)
+    ok = denom_p.abs() > 0
+    safe_denom = torch.where(ok, denom_p, torch.ones_like(denom_p))
+    p_hat = torch.where(ok, numer_p / safe_denom, torch.ones_like(denom_p))
+    shape = (-1,) + (1,) * p_hat.ndim
+    chosen = (ps.reshape(shape) - p_hat.unsqueeze(0)).abs().argmin(0)
+    same_step = (chosen == oracle["best_step"]) & ok
+
+    return {
+        "mean_rel": rel.clamp_min(0).mean().item(),
+        "max_rel": rel.max().item(),
+        "worse_pct": worse.float().mean().item() * 100.0,
+        "match_pct": (~worse).float().mean().item() * 100.0,
+        "same_step_pct": same_step.float().mean().item() * 100.0,
+    }
+
+
+_QUALITY_HDR = (
+    f"{'variant':>22} {'mean_regret':>12} {'max_regret':>12} "
+    f"{'worse%':>8} {'match%':>8} {'same_step%':>11} {'steps med/p95/max':>18}"
+)
+
+
+def _fmt_quality(name, m, steps=None):
+    if steps is None:
+        s = "-"
+    else:
+        f = steps.float()
+        s = (
+            f"{f.median().item():.0f}/"
+            f"{f.quantile(0.95).item():.0f}/"
+            f"{f.max().item():.0f}"
+        )
+    return (
+        f"{name:>22} {m['mean_rel']:>12.3e} {m['max_rel']:>12.3e} "
+        f"{m['worse_pct']:>8.2f} {m['match_pct']:>8.2f} "
+        f"{m['same_step_pct']:>11.2f} {s:>18}"
+    )
+
+
+def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
+                chunk_size, n_override, patience_sweep):
+    """Quality-only pass: no timing, so diagnostics cannot skew latency."""
+    total_steps = int(maxshrink * grid)
+
+    print("Building oracle (eager full grid, early stopping disabled) ...")
+    oracle = build_oracle(observed, args, token_args, maxshrink, grid, norm)
+    ties = (
+        (oracle["errs"] <= oracle["best_error"].unsqueeze(0) * (1 + 1e-6))
+        .sum(0)
+        .float()
+    )
+    print(
+        f"  steps={total_steps}  groups={oracle['best_error'].numel()}  "
+        f"tied-with-best steps: mean {ties.mean().item():.2f}, "
+        f"max {ties.max().item():.0f}"
+    )
+
+    n_derived, detail = derive_num_buckets(args, grid, maxshrink)
+    if n_derived is None:
+        print(f"\nderived N: unsupported — {detail}")
+    else:
+        print(f"\nderived N = {n_derived}   ({detail})")
+    n_sel = n_override if n_override is not None else (n_derived or 1)
+    print(f"using N = {n_sel}" + (" (--n-buckets override)" if n_override else ""))
+
+    def _an(bmin, bmax):
+        return analyze(bmin, bmax, observed, args, token_args, norm, oracle)
+
+    # Phase 0 — full-grid variants. These do no bucket approximation and no
+    # early stopping, so any regret here comes from the codebook /
+    # scale_base*p linearisation itself.
+    print("\n=== phase 0: full-grid (isolates codebook + linearised scale) ===")
+    print(_QUALITY_HDR)
+    for name, fn in [
+        ("eager(+patience)", grid_search_eager),
+        ("compiled", grid_search_compiled),
+        ("triton", grid_search_triton),
+        ("triton_cutoff", grid_search_triton_cutoff),
+        ("triton_mindist", grid_search_triton_mindist),
+        ("triton_multigrp", grid_search_triton_multigroup),
+    ]:
+        bmin, bmax = fn(
+            observed, args, token_args, maxshrink, patience, grid, norm, chunk_size
+        )
+        print(_fmt_quality(name, _an(bmin, bmax)))
+
+    # Phase A — bucket approximation only. Patience is disabled by setting it
+    # above the step count so the gate can never trigger.
+    print("\n=== phase A: bucket approximation, patience OFF ===")
+    print(_QUALITY_HDR)
+    no_patience = total_steps + 1
+    for n in (1, 2, 3, 4):
+        bmin, bmax, steps = _launch_incrN_patience(
+            observed, args, maxshrink, no_patience, grid, norm, n, record_steps=True
+        )
+        print(_fmt_quality(f"N={n} patience=off", _an(bmin, bmax), steps))
+
+    # Phase B — early stopping only, at the selected N.
+    print(f"\n=== phase B: patience sweep at N={n_sel} ===")
+    print(_QUALITY_HDR)
+    for pat in [no_patience] + list(patience_sweep):
+        bmin, bmax, steps = _launch_incrN_patience(
+            observed, args, maxshrink, pat, grid, norm, n_sel, record_steps=True
+        )
+        label = "off" if pat == no_patience else str(pat)
+        print(_fmt_quality(f"N={n_sel} patience={label}", _an(bmin, bmax), steps))
+
+    print(
+        "\nregret = (variant error - oracle best error) / oracle best error, "
+        "recomputed via calculate_qparams + fake_quantize."
+        "\nmatch% counts groups within rtol of the oracle best (tie-aware); "
+        "same_step% is informational only."
+    )
+
+
 # ── Benchmark infrastructure ─────────────────────────────────────────────────
 
 
@@ -1747,6 +2008,25 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
+    parser.add_argument(
+        "--quality",
+        action="store_true",
+        help="run accuracy diagnostics against an eager full-grid oracle "
+        "instead of timing (the two never run together)",
+    )
+    parser.add_argument(
+        "--n-buckets",
+        type=int,
+        default=None,
+        help="override the derived number of buckets checked per step",
+    )
+    parser.add_argument(
+        "--patience-sweep",
+        type=int,
+        nargs="+",
+        default=[15, 10, 5],
+        help="patience values to sweep in --quality phase B",
+    )
     args = parser.parse_args()
 
     total_steps = int(args.maxshrink * args.grid)
@@ -1770,6 +2050,14 @@ def main():
     )
     print(f"Observed shape: {observed.shape}")
     print()
+
+    if args.quality:
+        run_quality(
+            observed, quant_args, token_args,
+            args.maxshrink, args.patience, args.grid, args.norm,
+            args.chunk_size, args.n_buckets, args.patience_sweep,
+        )
+        return
 
     inputs = (
         observed, quant_args, token_args,
