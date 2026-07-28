@@ -1986,9 +1986,16 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
 # ── Benchmark infrastructure ─────────────────────────────────────────────────
 
 
-def make_observer_inputs(rows, cols, strategy, group_size, num_bits, device):
-    """Create a weight tensor and flatten it for calibration."""
-    torch.manual_seed(42)
+def make_observer_inputs(rows, cols, strategy, group_size, num_bits, device,
+                         seed=42):
+    """Create a weight tensor and flatten it for calibration.
+
+    Note that changing only rows/cols does not change the data: the groups
+    are 128 consecutive draws from the same RNG stream, and the per-group
+    error is scale invariant, so two shapes with the same element count give
+    identical quality results. Vary ``seed`` to actually vary the data.
+    """
+    torch.manual_seed(seed)
     module = torch.nn.Linear(cols, rows, bias=False, device=device)
 
     if strategy == "group":
@@ -2108,6 +2115,13 @@ def main():
         action="store_true",
         help="continue past a failed phase 0 gate",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="weight init seed. Changing rows/cols alone does not change the "
+        "data seen per group, so vary this to test a different draw",
+    )
     args = parser.parse_args()
 
     total_steps = int(args.maxshrink * args.grid)
@@ -2127,7 +2141,8 @@ def main():
     print()
 
     observed, quant_args, token_args = make_observer_inputs(
-        args.rows, args.cols, args.strategy, args.group_size, args.num_bits, args.device
+        args.rows, args.cols, args.strategy, args.group_size, args.num_bits,
+        args.device, args.seed,
     )
     print(f"Observed shape: {observed.shape}")
     print()
