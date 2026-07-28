@@ -1880,6 +1880,7 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
     # and compiled paths actually give up relative to the oracle.
     print("\n--- reference (early stopping ON, not gated) ---")
     print(_QUALITY_HDR)
+    noise_floor = 0.0
     for name, fn in [
         ("eager(patience=%d)" % patience, grid_search_eager),
         ("compiled(patience=%d)" % patience, grid_search_compiled),
@@ -1887,7 +1888,15 @@ def run_quality(observed, args, token_args, maxshrink, patience, grid, norm,
         bmin, bmax = fn(
             observed, args, token_args, maxshrink, patience, grid, norm, chunk_size
         )
-        print(_fmt_quality(name, _an(bmin, bmax)))
+        m = _an(bmin, bmax)
+        print(_fmt_quality(name, m))
+        if fn is grid_search_compiled:
+            noise_floor = m["max_rel"]
+    print(
+        f"compiled runs the same math as the oracle, so its {noise_floor:.3e} max "
+        "regret is the float-reassociation noise floor; regret at or below it "
+        "carries no information."
+    )
 
     # Phase 0 — GATE. These variants search the whole grid with no bucket
     # approximation and no early stopping, so they should reproduce the oracle
@@ -2084,9 +2093,11 @@ def main():
     parser.add_argument(
         "--gate-rtol",
         type=float,
-        default=1e-6,
+        default=1e-4,
         help="max relative regret a full-grid variant may show before the "
-        "phase 0 gate fails",
+        "phase 0 gate fails. Kept above the float-reassociation noise floor "
+        "(torch.compile alone produces ~1e-5 on identical math) and far below "
+        "a real divergence (the codebook off-by-one produced 3.5e-1)",
     )
     parser.add_argument(
         "--force",
