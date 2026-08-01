@@ -26,6 +26,7 @@ Usage:
 import argparse
 import gc
 import json
+import math
 import subprocess
 import sys
 import time
@@ -104,7 +105,10 @@ def perplexity(model, enc, n_windows, seqlen):
         with torch.no_grad():
             out = model(batch, labels=batch)
         total += out.loss.float().item() * seqlen
-    return float(torch.exp(torch.tensor(total / (n_windows * seqlen))))
+    # math.exp, not torch.exp on a fresh tensor: that would default to
+    # float32 and truncate the result after the json rounding was already
+    # removed for the same reason
+    return math.exp(total / (n_windows * seqlen))
 
 
 def run_one(name, cli):
