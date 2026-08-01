@@ -38,8 +38,10 @@ CONFIGS = {
     # the model is loaded in bfloat16, so do not label this fp16
     "unquantized_bf16": (None, None),
     # the patience sweep. HDCharles asked whether the default should move
-    # from 5 to 10 or thereabouts, so these are the rows that answer it,
-    # with the full grid as the ceiling nothing can beat.
+    # from 5 to 10 or thereabouts, so these are the rows that answer it.
+    # eager_full is the reference the others approximate: it minimises the
+    # observer's own error over the whole grid, which is not the same as
+    # giving the best model perplexity.
     "eager_p5": ("eager", 5),
     "eager_p10": ("eager", 10),
     "eager_p15": ("eager", 15),
@@ -199,7 +201,9 @@ def run_one(name, cli):
         "patience": patience,
         "quant_s": round(quant_s, 2),
         "peak_mb": round(peak_mb, 1),
-        "ppl": round(ppl, 4),
+        # full precision: rounding here would hide exactly the small
+        # differences this script exists to detect
+        "ppl": ppl,
         "kernel_calls": n_hits,
         "eval_windows": windows,
     }
@@ -247,23 +251,30 @@ def main():
             results.append(row)
             print(json.dumps(row), flush=True)
 
+        # only a row that actually produced a number can be the baseline;
+        # a failed eager_p5 would otherwise KeyError on base["ppl"] below
         base = next(
-            (r for r in results if r.get("config") == "eager_p5"), None
+            (r for r in results
+             if r.get("config") == "eager_p5" and "ppl" in r),
+            None,
         )
         print()
-        print(f"{'config':>12} {'path':>7} {'patience':>9} {'ppl':>10} "
-              f"{'d ppl':>9} {'quant_s':>9} {'peak_mb':>9} {'calls':>7}")
+        if base is None:
+            print("")
+            print("no usable eager_p5 baseline, d ppl left blank")
+        print(f"{'config':>12} {'path':>7} {'patience':>9} {'ppl':>12} "
+              f"{'d ppl':>11} {'quant_s':>9} {'peak_mb':>9} {'calls':>7}")
         for r in results:
             if "ppl" not in r:
                 print(f"{r['config']:>12} {'failed':>50}")
                 continue
             d = (
-                f"{r['ppl'] - base['ppl']:+.4f}"
+                f"{r['ppl'] - base['ppl']:+.6f}"
                 if base and r is not base
                 else "-"
             )
             print(f"{r['config']:>12} {r['path']:>7} "
-                  f"{str(r['patience']):>9} {r['ppl']:>10.4f} {d:>9} "
+                  f"{str(r['patience']):>9} {r['ppl']:>12.6f} {d:>11} "
                   f"{r['quant_s']:>9.2f} {r['peak_mb']:>9.1f} "
                   f"{str(r['kernel_calls']):>7}")
         print(
