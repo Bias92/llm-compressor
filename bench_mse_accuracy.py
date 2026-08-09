@@ -11,9 +11,12 @@ whether it was taken: ``can_use_triton`` is forced False for the eager rows,
 and ``grid_search_triton`` is wrapped in a counter for the triton row. The
 search that runs is production's either way.
 
-The Triton path searches the whole grid and has no patience, so the
-comparison that matters is against eager at today's default patience - that
-is what a user's numbers would change from.
+Both paths take a patience, but they count it differently: eager keeps one
+counter for the whole tensor and resets it whenever any group improves,
+while each Triton program only sees its own group and stops on its own. So
+the sweep runs both sides at 5, 10, 15 and off, and the comparison that
+matters is against eager at today's default - that is what a user's numbers
+would change from.
 
 Every config runs in its own process, so no compiled kernel cache, allocator
 state or observer registration carries between them.
@@ -47,9 +50,13 @@ CONFIGS = {
     "eager_p10": ("eager", 10),
     "eager_p15": ("eager", 15),
     "eager_full": ("eager", 10**6),
-    # the kernel has no patience; it searches the whole grid, so it should
-    # land on eager_full and the patience column is not meaningful for it
-    "triton": ("triton", None),
+    # the same sweep on the kernel. its counter is per group rather than per
+    # tensor, so the same number is a strictly earlier stop and these rows
+    # are not expected to track the eager ones step for step
+    "triton_p5": ("triton", 5),
+    "triton_p10": ("triton", 10),
+    "triton_p15": ("triton", 15),
+    "triton_full": ("triton", 10**6),
 }
 
 
@@ -75,7 +82,7 @@ def took_triton_path():
     return lambda: len(hits)
 
 
-def build_recipe(num_bits, group_size, patience):
+def build_recipe(num_bits, group_size, patience, symmetric):
     return f"""
 quant_stage:
     quant_modifiers:
@@ -87,7 +94,7 @@ quant_stage:
                     weights:
                         num_bits: {num_bits}
                         type: "int"
-                        symmetric: true
+                        symmetric: {str(symmetric).lower()}
                         strategy: "group"
                         group_size: {group_size}
                         observer: "mse"
@@ -131,10 +138,6 @@ def run_one(name, cli):
     quant_s = 0.0
     peak_mb = 0.0
     if path is not None:
-        # the kernel ignores patience, but the recipe still needs a value;
-        # use the full-grid setting so the eager fallback inside the same
-        # run would not early stop either
-        effective_patience = 10**6 if patience is None else patience
         from datasets import load_dataset
 
         from llmcompressor import oneshot
@@ -169,7 +172,7 @@ def run_one(name, cli):
             num_calibration_samples=cli.calib_samples,
             max_seq_length=cli.calib_seqlen,
             recipe=build_recipe(
-                cli.num_bits, cli.group_size, effective_patience
+                cli.num_bits, cli.group_size, patience, not cli.asymmetric
             ),
         )
         torch.cuda.synchronize()
@@ -221,6 +224,11 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     ap.add_argument("--num-bits", type=int, default=8)
+    ap.add_argument(
+        "--asymmetric",
+        action="store_true",
+        help="quantize weights asymmetrically",
+    )
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--calib-samples", type=int, default=64)
     ap.add_argument("--calib-seqlen", type=int, default=512)
